@@ -1,0 +1,1113 @@
+use anyhow::{Context, Result, anyhow, bail};
+use futures_util::StreamExt;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
+
+use crate::config::Config;
+use crate::types::{Completion, FunctionCall, Message, ToolCall, Usage};
+
+const MAX_TOOL_ARGUMENT_CHARS: usize = 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Unifies tool_call ids across the flow: synthesized ids (call_0, call_1 by position)
+/// repeat between rounds and cloud upstreams rename ids per request. On collisions the
+/// upstream attributes tool results to the wrong round and the model enters infinite
+/// verification. Only repeated ids are renamed, as a pair (call + its result), with a
+/// deterministic suffix; ids that are already unique stay untouched.
+pub fn unique_tool_call_ids(messages: &[Message]) -> Vec<Message> {
+    let mut used: HashSet<String> = HashSet::new();
+    let mut duplicate = 0usize;
+    let mut caller_map: HashMap<String, String> = HashMap::new();
+    let mut result = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        let mut mapped = message.clone();
+        if let Some(calls) = &message.tool_calls {
+            if !calls.is_empty() {
+                caller_map.clear();
+                let mut mapped_calls = Vec::with_capacity(calls.len());
+                for call in calls {
+                    let mut final_id = call.id.clone();
+                    if !call.id.is_empty() {
+                        if used.contains(&call.id) {
+                            loop {
+                                duplicate += 1;
+                                let candidate = format!("{}__d{duplicate}", call.id);
+                                if !used.contains(&candidate) {
+                                    final_id = candidate;
+                                    break;
+                                }
+                            }
+                        }
+                        used.insert(final_id.clone());
+                        caller_map.insert(call.id.clone(), final_id.clone());
+                    }
+                    let mut mapped_call = call.clone();
+                    mapped_call.id = final_id;
+                    mapped_calls.push(mapped_call);
+                }
+                mapped.tool_calls = Some(mapped_calls);
+            }
+        }
+        if mapped.role == "tool" {
+            if let Some(id) = &mapped.tool_call_id {
+                if let Some(mapped_id) = caller_map.get(id) {
+                    mapped.tool_call_id = Some(mapped_id.clone());
+                }
+            }
+        }
+        result.push(mapped);
+    }
+    result
+}
+
+/// True when any non-empty tool-call id repeats, i.e. when [`unique_tool_call_ids`]
+/// would actually rewrite something. Lets requests skip cloning the whole
+/// conversation in the common case.
+fn has_duplicate_tool_call_ids(messages: &[Message]) -> bool {
+    let mut used: HashSet<&str> = HashSet::new();
+    for message in messages {
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                if !call.id.is_empty() && !used.insert(call.id.as_str()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Adapts OpenAI messages to Ollama's native format: non-string content serialized and
+/// arguments as a JSON OBJECT (a raw string triggers HTTP 400 "can't find closing '}'").
+/// id/type are preserved: the cloud bridge links the tool result by id.
+pub fn to_ollama_messages(messages: &[Message]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut mapped = serde_json::to_value(message).unwrap_or(Value::Null);
+            if message.role == "developer" {
+                mapped["role"] = json!("system");
+            }
+            if let Some(content) = &message.content {
+                if !content.is_string() && !content.is_array() && !content.is_null() {
+                    mapped["content"] = Value::String(content.to_string());
+                }
+            }
+            if let Some(calls) = &message.tool_calls {
+                let mapped_calls: Vec<Value> = calls
+                    .iter()
+                    .map(|call| {
+                        let parsed = serde_json::from_str::<Value>(&call.function.arguments)
+                            .ok()
+                            .filter(Value::is_object);
+                        let mut function = json!({ "name": call.function.name });
+                        if let Some(parsed) = parsed {
+                            function["arguments"] = parsed;
+                        }
+                        json!({ "id": call.id, "type": call.kind, "function": function })
+                    })
+                    .collect();
+                mapped["tool_calls"] = Value::Array(mapped_calls);
+            }
+            mapped
+        })
+        .collect()
+}
+
+/// Turns an .../v1/chat/completions endpoint into .../api/chat on the same host.
+pub fn ollama_chat_url(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.split_once("://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix("/chat/completions").unwrap_or(path);
+    let path = path.strip_suffix("/v1").unwrap_or(path);
+    Some(format!("{scheme}://{authority}{path}/api/chat"))
+}
+
+fn models_endpoint(endpoint: &str) -> Option<String> {
+    let base = endpoint.trim_end_matches('/');
+    let base = base.strip_suffix("/chat/completions")?;
+    Some(format!("{base}/models"))
+}
+
+fn parse_usage(value: &Value) -> Usage {
+    Usage {
+        prompt_tokens: value
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        completion_tokens: value
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Returns the byte length of the first complete frame and the number of bytes consumed.
+fn next_sse_frame(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_subslice(buffer, b"\n\n").map(|index| (index, index + 2));
+    let crlf = find_subslice(buffer, b"\r\n\r\n").map(|index| (index, index + 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+pub struct StreamParser<'a> {
+    on_text: &'a mut dyn FnMut(&str),
+    on_reasoning: &'a mut dyn FnMut(&str),
+    on_tool_call: &'a mut dyn FnMut(&str),
+    native: bool,
+    content_type: String,
+    tool_calls: BTreeMap<i64, ToolCall>,
+    content: String,
+    usage: Option<Usage>,
+    finish_reason: Option<String>,
+    finished: bool,
+    saw_data_line: bool,
+    bytes_read: usize,
+    max_response_bytes: usize,
+}
+
+impl<'a> StreamParser<'a> {
+    pub fn new(
+        on_text: &'a mut dyn FnMut(&str),
+        on_reasoning: &'a mut dyn FnMut(&str),
+        on_tool_call: &'a mut dyn FnMut(&str),
+        native: bool,
+        content_type: String,
+    ) -> Self {
+        Self {
+            on_text,
+            on_reasoning,
+            on_tool_call,
+            native,
+            content_type,
+            tool_calls: BTreeMap::new(),
+            content: String::new(),
+            usage: None,
+            finish_reason: None,
+            finished: false,
+            saw_data_line: false,
+            bytes_read: 0,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+        }
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn add_bytes(&mut self, count: usize) -> Result<()> {
+        self.bytes_read += count;
+        if self.bytes_read > self.max_response_bytes {
+            bail!("Endpoint streaming response exceeds the {MAX_RESPONSE_BYTES} byte limit.");
+        }
+        Ok(())
+    }
+
+    pub fn feed_sse_frame(&mut self, frame: &str) -> Result<()> {
+        let data = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.trim_start())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let data = data.trim();
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data == "[DONE]" {
+            self.finished = true;
+            return Ok(());
+        }
+        let event: Value = serde_json::from_str(data)
+            .map_err(|_| anyhow!("Endpoint sent an invalid streaming event."))?;
+        if let Some(error) = event.get("error").filter(|value| !value.is_null()) {
+            let detail = match error {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            bail!("Endpoint streaming error: {}", truncate(&detail, 1000));
+        }
+        if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
+            self.usage = Some(parse_usage(usage));
+        }
+        let Some(choice) = event.get("choices").and_then(|choices| choices.get(0)) else {
+            return Ok(());
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if !reason.is_empty() {
+                self.finish_reason = Some(reason.to_string());
+            }
+        }
+        let delta = choice.get("delta").unwrap_or(&Value::Null);
+        let reasoning = delta
+            .get("reasoning_summary")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                delta
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+            });
+        if let Some(reasoning) = reasoning {
+            (self.on_reasoning)(reasoning);
+        }
+        if let Some(content) = delta.get("content") {
+            if let Some(text) = content.as_str() {
+                if !text.is_empty() {
+                    self.content.push_str(text);
+                    (self.on_text)(text);
+                }
+            } else if let Some(parts) = content.as_array() {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            self.content.push_str(text);
+                            (self.on_text)(text);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for delta_call in calls {
+                let index = delta_call
+                    .get("index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(self.tool_calls.len() as i64);
+                let entry = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
+                    id: String::new(),
+                    kind: "function".to_string(),
+                    function: FunctionCall::default(),
+                });
+                if let Some(id) = delta_call.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        entry.id = id.to_string();
+                    }
+                }
+                if let Some(kind) = delta_call.get("type").and_then(Value::as_str) {
+                    if !kind.is_empty() {
+                        entry.kind = kind.to_string();
+                    }
+                }
+                if let Some(name) = delta_call
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    if !name.is_empty() {
+                        entry.function.name.push_str(name);
+                        (self.on_tool_call)(&entry.function.name);
+                    }
+                }
+                if let Some(arguments) = delta_call
+                    .get("function")
+                    .and_then(|function| function.get("arguments"))
+                    .and_then(Value::as_str)
+                {
+                    if !arguments.is_empty() {
+                        entry.function.arguments.push_str(arguments);
+                        if entry.function.arguments.len() > MAX_TOOL_ARGUMENT_CHARS {
+                            bail!("Endpoint returned tool arguments larger than the 1 MiB limit.");
+                        }
+                        (self.on_tool_call)(&entry.function.name);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn feed_ndjson_line(&mut self, line: &str) -> Result<()> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let event: Value = serde_json::from_str(trimmed)
+            .map_err(|_| anyhow!("Endpoint sent an invalid streaming event."))?;
+        if let Some(error) = event.get("error").filter(|value| !value.is_null()) {
+            let detail = match error {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            // An error as the FIRST line labeled application/json means the whole response is
+            // the error (cloud bridge / dead runner): endpoint shape, not stream corruption.
+            let code = if !self.saw_data_line && self.content_type.contains("application/json") {
+                "ENDPOINT_SHAPE"
+            } else {
+                "STREAM_ERROR"
+            };
+            bail!(
+                "[{code}] Endpoint streaming error: {}",
+                truncate(&detail, 1000)
+            );
+        }
+        self.saw_data_line = true;
+
+        if let Some(message) = event.get("message").filter(|value| value.is_object()) {
+            if let Some(thinking) = message.get("thinking").and_then(Value::as_str) {
+                if !thinking.is_empty() {
+                    (self.on_reasoning)(thinking);
+                }
+            }
+            if let Some(text) = message.get("content").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    self.content.push_str(text);
+                    (self.on_text)(text);
+                }
+            }
+            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for (position, incoming) in calls.iter().enumerate() {
+                    let index = incoming
+                        .get("index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(position as i64);
+                    let name = incoming
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let arguments = match incoming
+                        .get("function")
+                        .and_then(|function| function.get("arguments"))
+                    {
+                        Some(Value::String(text)) => text.clone(),
+                        Some(Value::Null) | None => String::new(),
+                        Some(other) => other.to_string(),
+                    };
+                    let complete_incoming = !arguments.is_empty()
+                        && serde_json::from_str::<Value>(&arguments)
+                            .ok()
+                            .map(|value| value.is_object())
+                            .unwrap_or(false);
+                    let existing = self.tool_calls.get(&index);
+                    let compatible_name = match existing {
+                        None => true,
+                        Some(call) => {
+                            name.is_empty()
+                                || call.function.name.is_empty()
+                                || name.starts_with(&call.function.name)
+                                || call.function.name.starts_with(name)
+                        }
+                    };
+                    let replace_complete =
+                        existing.is_some() && complete_incoming && compatible_name;
+                    let replace_repeated = !replace_complete
+                        && existing
+                            .map(|call| {
+                                name.starts_with(&call.function.name)
+                                    && arguments.starts_with(&call.function.arguments)
+                            })
+                            .unwrap_or(false);
+                    if replace_complete {
+                        // The incoming args form a complete object: replace, never concatenate.
+                        let entry = self.tool_calls.get_mut(&index).expect("entry exists");
+                        entry.function.arguments = arguments;
+                        if !name.is_empty()
+                            && (entry.function.name.is_empty()
+                                || name.starts_with(&entry.function.name))
+                        {
+                            entry.function.name = name.to_string();
+                        }
+                    } else if replace_repeated {
+                        // The chunk repeats the full call so far (accumulated): replace.
+                        let entry = self.tool_calls.get_mut(&index).expect("entry exists");
+                        entry.function.name = name.to_string();
+                        entry.function.arguments = arguments;
+                    } else {
+                        let entry = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
+                            id: format!("call_{index}"),
+                            kind: "function".to_string(),
+                            function: FunctionCall::default(),
+                        });
+                        entry.function.name.push_str(name);
+                        entry.function.arguments.push_str(&arguments);
+                        if entry.function.arguments.len() > MAX_TOOL_ARGUMENT_CHARS {
+                            bail!("Endpoint returned tool arguments larger than the 1 MiB limit.");
+                        }
+                    }
+                    let current_name = self
+                        .tool_calls
+                        .get(&index)
+                        .map(|call| call.function.name.clone())
+                        .unwrap_or_default();
+                    (self.on_tool_call)(&current_name);
+                }
+            }
+        }
+
+        if event.get("done").and_then(Value::as_bool).unwrap_or(false) {
+            self.finished = true;
+            if let Some(reason) = event.get("done_reason").and_then(Value::as_str) {
+                if !reason.is_empty() {
+                    self.finish_reason =
+                        Some(if reason == "abort" { "aborted" } else { reason }.to_string());
+                }
+            }
+            let prompt_tokens = event.get("prompt_eval_count").and_then(Value::as_u64);
+            let completion_tokens = event.get("eval_count").and_then(Value::as_u64);
+            if prompt_tokens.is_some() || completion_tokens.is_some() {
+                self.usage = Some(Usage {
+                    prompt_tokens: prompt_tokens.unwrap_or(0),
+                    completion_tokens: completion_tokens.unwrap_or(0),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Completion> {
+        if !self.finished && self.finish_reason.is_none() {
+            bail!("[STREAM_ENDED] Endpoint stream ended before a complete response was received.");
+        }
+        let content = if self.content.is_empty() {
+            Some(Value::Null)
+        } else {
+            Some(Value::String(self.content))
+        };
+        let mut message = Message::assistant(content, None);
+        if !self.tool_calls.is_empty() {
+            message.tool_calls = Some(self.tool_calls.into_values().collect());
+        }
+        if self.finish_reason.as_deref() == Some("length") {
+            bail!(
+                "Endpoint stopped at its output token limit; the partial response was discarded."
+            );
+        }
+        if self.finish_reason.as_deref() == Some("content_filter") {
+            bail!("Endpoint stopped the response because of its content filter.");
+        }
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                if !self.native && call.id.is_empty() {
+                    bail!("[INVALID_TOOL_CALL] Endpoint returned an incomplete tool call.");
+                }
+                if call.function.name.is_empty() {
+                    bail!("[INVALID_TOOL_CALL] Endpoint returned an incomplete tool call.");
+                }
+                let valid = serde_json::from_str::<Value>(&call.function.arguments)
+                    .ok()
+                    .map(|value| value.is_object())
+                    .unwrap_or(false);
+                if !valid {
+                    bail!(
+                        "[INVALID_TOOL_CALL] Endpoint returned invalid arguments for tool {}.",
+                        call.function.name
+                    );
+                }
+            }
+        }
+        Ok(Completion {
+            message,
+            usage: self.usage,
+            finish_reason: self.finish_reason,
+        })
+    }
+}
+
+async fn read_prefix(response: reqwest::Response, max_bytes: usize) -> String {
+    let mut collected: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let remaining = max_bytes.saturating_sub(collected.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(chunk.len());
+        collected.extend_from_slice(&chunk[..take]);
+        if collected.len() >= max_bytes {
+            break;
+        }
+    }
+    let mut text = String::from_utf8_lossy(&collected).to_string();
+    if collected.len() >= max_bytes {
+        text.push_str(" [response excerpt truncated]");
+    }
+    text
+}
+
+pub struct Client {
+    pub endpoint: String,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub ollama_think: Option<String>,
+    http: reqwest::Client,
+}
+
+impl Client {
+    pub fn new(config: &Config) -> Result<Self> {
+        let mut builder = reqwest::Client::builder();
+        if config.timeout_ms > 0 {
+            builder = builder.timeout(Duration::from_millis(config.timeout_ms));
+        }
+        let http = builder.build().context("could not build the HTTP client")?;
+        Ok(Self {
+            endpoint: config.endpoint.clone(),
+            api_key: config.api_key.clone(),
+            model: config.model.clone(),
+            ollama_think: config.ollama_think.clone(),
+            http,
+        })
+    }
+
+    pub async fn complete(
+        &self,
+        messages: &[Message],
+        tools: Option<&[Value]>,
+        on_text: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(&str),
+        on_tool_call: &mut dyn FnMut(&str),
+    ) -> Result<Completion> {
+        let native_target = self
+            .ollama_think
+            .as_ref()
+            .and_then(|_| ollama_chat_url(&self.endpoint));
+        let unique_storage;
+        let unique: &[Message] = if has_duplicate_tool_call_ids(messages) {
+            unique_storage = unique_tool_call_ids(messages);
+            unique_storage.as_slice()
+        } else {
+            messages
+        };
+        let body_messages = if native_target.is_some() {
+            Value::Array(to_ollama_messages(unique))
+        } else {
+            serde_json::to_value(unique)?
+        };
+        let mut body = json!({
+            "model": self.model,
+            "messages": body_messages,
+            "stream": true
+        });
+        if let Some(think) = &self.ollama_think {
+            body["think"] = match think.as_str() {
+                "false" => json!(false),
+                "true" => json!(true),
+                other => json!(other),
+            };
+        }
+        if let Some(tools) = tools {
+            body["tools"] = json!(tools);
+            body["tool_choice"] = json!("auto");
+        }
+
+        let target = native_target.as_deref().unwrap_or(&self.endpoint);
+        let mut request = self.http.post(target).json(&body);
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send().await.map_err(|error| {
+            anyhow!("Could not connect to the OpenAI-compatible endpoint: {error}")
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = read_prefix(response, 8 * 1024).await;
+            bail!("Endpoint returned HTTP {status}: {body_text}");
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+        let native = native_target.is_some();
+        // Native Ollama emits NDJSON; the cloud bridge labels its stream application/json.
+        // Only SSE is excluded on this path.
+        let use_ndjson = native && !content_type.contains("text/event-stream");
+        if !use_ndjson && !content_type.contains("text/event-stream") {
+            let body_text = read_prefix(response, 2 * 1024).await;
+            let expected = if native {
+                "streaming NDJSON"
+            } else {
+                "streaming"
+            };
+            bail!(
+                "[ENDPOINT_SHAPE] The endpoint did not return a {expected} response (Content-Type: {}). Response: {body_text}",
+                if content_type.is_empty() {
+                    "unknown"
+                } else {
+                    &content_type
+                }
+            );
+        }
+
+        let mut parser =
+            StreamParser::new(on_text, on_reasoning, on_tool_call, native, content_type);
+        let mut stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("could not read the streaming response")?;
+            parser.add_bytes(chunk.len())?;
+            buffer.extend_from_slice(&chunk);
+            if use_ndjson {
+                while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = buffer.drain(..=position).collect();
+                    let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+                    parser.feed_ndjson_line(&text)?;
+                    if parser.finished() {
+                        break;
+                    }
+                }
+            } else {
+                while let Some((frame_len, consumed)) = next_sse_frame(&buffer) {
+                    let text = String::from_utf8_lossy(&buffer[..frame_len]).to_string();
+                    buffer.drain(..consumed);
+                    parser.feed_sse_frame(&text)?;
+                    if parser.finished() {
+                        break;
+                    }
+                }
+            }
+            if parser.finished() {
+                break;
+            }
+        }
+        if !parser.finished() && !buffer.is_empty() {
+            let rest = String::from_utf8_lossy(&buffer).to_string();
+            if !rest.trim().is_empty() {
+                if use_ndjson {
+                    parser.feed_ndjson_line(&rest)?;
+                } else {
+                    parser.feed_sse_frame(&rest)?;
+                }
+            }
+        }
+        parser.finish()
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<ModelEntry>> {
+        let url = models_endpoint(&self.endpoint)
+            .ok_or_else(|| anyhow!("Cannot derive the model catalog URL from this endpoint."))?;
+        let mut request = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(15))
+            .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let suffix = if status == reqwest::StatusCode::NOT_FOUND
+                || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            {
+                " (this server does not expose a model catalog)"
+            } else {
+                ""
+            };
+            bail!("Could not list models: HTTP {status}{suffix}.");
+        }
+        let payload: Value = response.json().await?;
+        let data = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("The model catalog must contain a data array."))?;
+        let mut seen = HashSet::new();
+        let mut models = Vec::new();
+        for entry in data {
+            let Some(id) = entry.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let id = id.trim();
+            if id.is_empty() || id.chars().any(|character| character.is_control()) {
+                continue;
+            }
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+            let context_window = entry
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .or_else(|| entry.get("context_length").and_then(Value::as_u64));
+            let input_modalities = entry
+                .get("input_modalities")
+                .and_then(Value::as_array)
+                .or_else(|| {
+                    entry
+                        .get("architecture")
+                        .and_then(|architecture| architecture.get("input_modalities"))
+                        .and_then(Value::as_array)
+                })
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|item| item.as_str().map(|text| text.to_string()))
+                        .collect::<Vec<_>>()
+                });
+            let supports_tools = entry
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("tools"))
+                .and_then(Value::as_bool);
+            models.push(ModelEntry {
+                id: id.to_string(),
+                context_window,
+                input_modalities,
+                supports_tools,
+            });
+        }
+        if models.is_empty() {
+            bail!("The API returned no available model identifiers.");
+        }
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(models)
+    }
+}
+
+/// A catalog entry from `GET /models`. Optional fields are populated when the
+/// endpoint advertises them (Ollama's OpenAI-compatible catalog typically only
+/// supplies `id`), and fall back to the configured defaults otherwise.
+#[derive(Clone, Debug)]
+pub struct ModelEntry {
+    pub id: String,
+    pub context_window: Option<u64>,
+    pub input_modalities: Option<Vec<String>>,
+    pub supports_tools: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn assistant_with_calls(ids: &[&str]) -> Message {
+        Message::assistant(
+            Some(json!(null)),
+            Some(
+                ids.iter()
+                    .map(|id| ToolCall {
+                        id: id.to_string(),
+                        kind: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: "{\"path\":\"a\"}".to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+        )
+    }
+
+    #[test]
+    fn repeated_tool_call_ids_are_renamed_with_their_results() {
+        let messages = vec![
+            assistant_with_calls(&["call_0"]),
+            Message::tool("call_0", "one"),
+            assistant_with_calls(&["call_0"]),
+            Message::tool("call_0", "two"),
+        ];
+        let unique = unique_tool_call_ids(&messages);
+        let first = unique[0].tool_calls.as_ref().unwrap()[0].id.clone();
+        let second = unique[2].tool_calls.as_ref().unwrap()[0].id.clone();
+        assert_eq!(first, "call_0");
+        assert_eq!(second, "call_0__d1");
+        assert_eq!(unique[1].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(unique[3].tool_call_id.as_deref(), Some("call_0__d1"));
+    }
+
+    #[test]
+    fn unique_tool_call_ids_are_untouched() {
+        let messages = vec![
+            assistant_with_calls(&["call_a"]),
+            Message::tool("call_a", "one"),
+            assistant_with_calls(&["call_b"]),
+            Message::tool("call_b", "two"),
+        ];
+        let unique = unique_tool_call_ids(&messages);
+        assert_eq!(unique[0].tool_calls.as_ref().unwrap()[0].id, "call_a");
+        assert_eq!(unique[2].tool_calls.as_ref().unwrap()[0].id, "call_b");
+    }
+
+    #[test]
+    fn duplicate_tool_ids_are_detected() {
+        let unique = vec![
+            assistant_with_calls(&["call_a"]),
+            Message::tool("call_a", "one"),
+            assistant_with_calls(&["call_b"]),
+            Message::tool("call_b", "two"),
+        ];
+        assert!(!has_duplicate_tool_call_ids(&unique));
+        let repeated = vec![
+            assistant_with_calls(&["call_0"]),
+            Message::tool("call_0", "one"),
+            assistant_with_calls(&["call_0"]),
+            Message::tool("call_0", "two"),
+        ];
+        assert!(has_duplicate_tool_call_ids(&repeated));
+    }
+
+    #[test]
+    fn ollama_messages_turn_arguments_into_objects() {
+        let messages = vec![assistant_with_calls(&["call_0"])];
+        let mapped = to_ollama_messages(&messages);
+        assert!(mapped[0]["tool_calls"][0]["function"]["arguments"].is_object());
+    }
+
+    #[test]
+    fn ollama_url_is_derived_from_openai_endpoint() {
+        assert_eq!(
+            ollama_chat_url("http://127.0.0.1:11434/v1/chat/completions").as_deref(),
+            Some("http://127.0.0.1:11434/api/chat")
+        );
+        assert_eq!(
+            ollama_chat_url("https://host.example/chat/completions").as_deref(),
+            Some("https://host.example/api/chat")
+        );
+        assert_eq!(
+            ollama_chat_url("https://host.example/v1/chat/completions").as_deref(),
+            Some("https://host.example/api/chat")
+        );
+    }
+
+    #[test]
+    fn sse_stream_accumulates_content_and_tool_calls() {
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut calls = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |chunk: &str| reasoning.push_str(chunk);
+        let mut on_tool_call = |name: &str| calls = name.to_string();
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            false,
+            "text/event-stream".to_string(),
+        );
+        parser
+            .feed_sse_frame("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}")
+            .unwrap();
+        parser
+            .feed_sse_frame("data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}")
+            .unwrap();
+        parser
+            .feed_sse_frame(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}",
+            )
+            .unwrap();
+        parser
+            .feed_sse_frame(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}",
+            )
+            .unwrap();
+        parser.feed_sse_frame("data: [DONE]").unwrap();
+        let completion = parser.finish().unwrap();
+        assert_eq!(completion.message.text(), "hello");
+        assert_eq!(completion.finish_reason.as_deref(), Some("tool_calls"));
+        let call = &completion.message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.function.name, "read_file");
+        assert_eq!(call.function.arguments, "{\"path\":\"a\"}");
+        assert_eq!(calls, "read_file");
+        assert_eq!(text, "hello");
+        assert_eq!(reasoning, "think");
+    }
+
+    #[test]
+    fn sse_usage_is_parsed() {
+        let mut on_text = |_chunk: &str| {};
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_chunk: &str| {};
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            false,
+            "text/event-stream".to_string(),
+        );
+        parser
+            .feed_sse_frame(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}",
+            )
+            .unwrap();
+        parser.feed_sse_frame("data: [DONE]").unwrap();
+        let completion = parser.finish().unwrap();
+        assert_eq!(completion.usage.unwrap().completion_tokens, 2);
+    }
+
+    #[test]
+    fn ndjson_replaces_complete_repeated_calls() {
+        let mut on_text = |_chunk: &str| {};
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_chunk: &str| {};
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            true,
+            "application/x-ndjson".to_string(),
+        );
+        parser
+            .feed_ndjson_line(
+                "{\"message\":{\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}",
+            )
+            .unwrap();
+        parser
+            .feed_ndjson_line(
+                "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]},\"done\":true,\"eval_count\":7,\"prompt_eval_count\":3}",
+            )
+            .unwrap();
+        let completion = parser.finish().unwrap();
+        let call = &completion.message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.function.name, "read_file");
+        assert_eq!(call.function.arguments, "{\"path\":\"a\"}");
+        assert_eq!(completion.usage.unwrap().completion_tokens, 7);
+    }
+
+    #[test]
+    fn ndjson_accumulates_fragmented_arguments() {
+        let mut on_text = |_chunk: &str| {};
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_chunk: &str| {};
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            true,
+            "application/x-ndjson".to_string(),
+        );
+        parser
+            .feed_ndjson_line(
+                "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}",
+            )
+            .unwrap();
+        parser
+            .feed_ndjson_line(
+                "{\"message\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"a\\\"}\"}}]},\"done\":true}",
+            )
+            .unwrap();
+        let completion = parser.finish().unwrap();
+        let call = &completion.message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.function.name, "read_file");
+        assert_eq!(call.function.arguments, "{\"path\":\"a\"}");
+    }
+
+    #[test]
+    fn ndjson_error_as_first_line_is_endpoint_shape() {
+        let mut on_text = |_chunk: &str| {};
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_chunk: &str| {};
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            true,
+            "application/json".to_string(),
+        );
+        let error = parser
+            .feed_ndjson_line("{\"error\":\"model not found\"}")
+            .unwrap_err();
+        assert!(error.to_string().contains("ENDPOINT_SHAPE"));
+    }
+
+    #[test]
+    fn incomplete_stream_is_rejected() {
+        let mut on_text = |_chunk: &str| {};
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_chunk: &str| {};
+        let parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            false,
+            "text/event-stream".to_string(),
+        );
+        let error = parser.finish().unwrap_err();
+        assert!(error.to_string().contains("STREAM_ENDED"));
+    }
+
+    #[tokio::test]
+    async fn complete_streams_sse_from_a_mock_endpoint() {
+        use crate::config::PermissionMode;
+        use std::path::PathBuf;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 16 * 1024];
+            let _ = socket.read(&mut request).await.expect("read request");
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],",
+                "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "test-model".to_string(),
+            context_window: 8192,
+            timeout_ms: 5_000,
+            ollama_think: None,
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        let mut text = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_name: &str| {};
+        let completion = client
+            .complete(
+                &[Message::user("hi")],
+                None,
+                &mut on_text,
+                &mut on_reasoning,
+                &mut on_tool_call,
+            )
+            .await
+            .expect("completion");
+        server.await.expect("server task");
+        assert_eq!(text, "hi");
+        assert_eq!(completion.message.text(), "hi");
+        assert_eq!(completion.usage.expect("usage").completion_tokens, 1);
+    }
+}
