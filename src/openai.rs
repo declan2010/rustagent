@@ -10,6 +10,38 @@ use crate::types::{Completion, FunctionCall, Message, ToolCall, Usage};
 const MAX_TOOL_ARGUMENT_CHARS: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Backoff schedule for recoverable endpoint errors (connect drops, 429, 5xx,
+/// non-streaming shape, and streams that end before any delta is emitted).
+/// Mirrors MinAgent's `ENDPOINT_RECOVERY_DELAYS_MS`.
+const ENDPOINT_RECOVERY_DELAYS_MS: [u64; 3] = [5_000, 15_000, 30_000];
+
+/// Classifies an endpoint error as retryable. A stream that ended or errored is
+/// only retryable when no delta was emitted yet, so partial output is never
+/// duplicated. Shape/connect/429/5xx errors are always retryable.
+fn is_recoverable_endpoint_error(error: &anyhow::Error, emitted_deltas: usize) -> bool {
+    let message = error.to_string();
+    if message.contains("[ENDPOINT_SHAPE]") {
+        return true;
+    }
+    if message.contains("[STREAM_ENDED]") || message.contains("[STREAM_ERROR]") {
+        return emitted_deltas == 0;
+    }
+    if message.contains("Could not connect to the OpenAI-compatible endpoint") {
+        return true;
+    }
+    if let Some(rest) = message.strip_prefix("Endpoint returned HTTP ") {
+        if let Some(code_text) = rest.split_whitespace().next() {
+            let code_text = code_text.trim_end_matches(':');
+            if let Ok(code) = code_text.parse::<u16>() {
+                if code == 429 || code >= 500 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Unifies tool_call ids across the flow: synthesized ids (call_0, call_1 by position)
 /// repeat between rounds and cloud upstreams rename ids per request. On collisions the
 /// upstream attributes tool results to the wrong round and the model enters infinite
@@ -869,8 +901,69 @@ impl Client {
             body["tool_choice"] = json!("auto");
         }
 
-        let target = native_target.as_deref().unwrap_or(&self.endpoint);
-        let mut request = self.http.post(target).json(&body);
+        let target = native_target.as_deref().unwrap_or(&self.endpoint).to_string();
+        let native = native_target.is_some();
+
+        // Shared delta counter so all three callbacks can increment it without
+        // multiple mutable borrows. A retry is only safe when this stays 0.
+        let emitted_deltas = std::cell::Cell::new(0usize);
+        let mut attempt = 0usize;
+        loop {
+            let mut on_text_w = |chunk: &str| {
+                emitted_deltas.set(emitted_deltas.get() + 1);
+                on_text(chunk);
+            };
+            let mut on_reasoning_w = |chunk: &str| {
+                emitted_deltas.set(emitted_deltas.get() + 1);
+                on_reasoning(chunk);
+            };
+            let mut on_tool_call_w = |name: &str| {
+                emitted_deltas.set(emitted_deltas.get() + 1);
+                on_tool_call(name);
+            };
+            match self
+                .stream_once(&target, native, &body, &mut on_text_w, &mut on_reasoning_w, &mut on_tool_call_w)
+                .await
+            {
+                Ok(completion) => return Ok(completion),
+                Err(error) => {
+                    if !is_recoverable_endpoint_error(&error, emitted_deltas.get())
+                        || attempt >= ENDPOINT_RECOVERY_DELAYS_MS.len()
+                    {
+                        return Err(error);
+                    }
+                    let delay = ENDPOINT_RECOVERY_DELAYS_MS[attempt];
+                    let kind = if error.to_string().contains("[ENDPOINT_SHAPE]") {
+                        "Non-streaming response from"
+                    } else {
+                        "Unstable endpoint:"
+                    };
+                    crate::ui::print_info(&crate::ui::warning(&format!(
+                        "· {kind} {target} ({}); retry {}/{} in {}s…",
+                        truncate(&error.to_string(), 70),
+                        attempt + 1,
+                        ENDPOINT_RECOVERY_DELAYS_MS.len(),
+                        delay / 1000,
+                    )));
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// One streaming attempt: sends the request, classifies the response shape,
+    /// and drives the [`StreamParser`] to completion.
+    async fn stream_once(
+        &self,
+        target: &str,
+        native: bool,
+        body: &Value,
+        on_text: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(&str),
+        on_tool_call: &mut dyn FnMut(&str),
+    ) -> Result<Completion> {
+        let mut request = self.http.post(target).json(body);
         if let Some(api_key) = &self.api_key {
             request = request.bearer_auth(api_key);
         }
@@ -888,24 +981,15 @@ impl Client {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_lowercase();
-        let native = native_target.is_some();
         // Native Ollama emits NDJSON; the cloud bridge labels its stream application/json.
         // Only SSE is excluded on this path.
         let use_ndjson = native && !content_type.contains("text/event-stream");
         if !use_ndjson && !content_type.contains("text/event-stream") {
             let body_text = read_prefix(response, 2 * 1024).await;
-            let expected = if native {
-                "streaming NDJSON"
-            } else {
-                "streaming"
-            };
+            let expected = if native { "streaming NDJSON" } else { "streaming" };
             bail!(
                 "[ENDPOINT_SHAPE] The endpoint did not return a {expected} response (Content-Type: {}). Response: {body_text}",
-                if content_type.is_empty() {
-                    "unknown"
-                } else {
-                    &content_type
-                }
+                if content_type.is_empty() { "unknown" } else { &content_type }
             );
         }
 
@@ -1064,6 +1148,36 @@ mod tests {
                     .collect(),
             ),
         )
+    }
+
+    #[test]
+    fn recoverable_errors_are_classified_like_minagent() {
+        let ended = anyhow::anyhow!(
+            "[STREAM_ENDED] Endpoint stream ended before a complete response was received."
+        );
+        assert!(is_recoverable_endpoint_error(&ended, 0));
+        assert!(!is_recoverable_endpoint_error(&ended, 5));
+        let stream_err = anyhow::anyhow!("[STREAM_ERROR] Endpoint streaming error: boom");
+        assert!(is_recoverable_endpoint_error(&stream_err, 0));
+        assert!(!is_recoverable_endpoint_error(&stream_err, 1));
+        let shape = anyhow::anyhow!(
+            "[ENDPOINT_SHAPE] The endpoint did not return a streaming response."
+        );
+        assert!(is_recoverable_endpoint_error(&shape, 12));
+        let connect = anyhow::anyhow!(
+            "Could not connect to the OpenAI-compatible endpoint: timed out"
+        );
+        assert!(is_recoverable_endpoint_error(&connect, 0));
+        let rate_limited = anyhow::anyhow!("Endpoint returned HTTP 429: too many requests");
+        assert!(is_recoverable_endpoint_error(&rate_limited, 0));
+        let server_error = anyhow::anyhow!("Endpoint returned HTTP 503: unavailable");
+        assert!(is_recoverable_endpoint_error(&server_error, 0));
+        let bad_request = anyhow::anyhow!("Endpoint returned HTTP 400: bad request");
+        assert!(!is_recoverable_endpoint_error(&bad_request, 0));
+        let invalid_tool = anyhow::anyhow!(
+            "[INVALID_TOOL_CALL] Endpoint returned an incomplete tool call."
+        );
+        assert!(!is_recoverable_endpoint_error(&invalid_tool, 0));
     }
 
     #[test]
