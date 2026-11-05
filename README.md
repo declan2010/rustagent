@@ -5,10 +5,10 @@ endpoints and Ollama. Same configuration variables, same streaming semantics (SS
 Ollama NDJSON), same workspace tools, and the same `proc` / `t/s` status line.
 
 This is **milestone 1** of the port: the core chat loop, streaming parsers, tool loop,
-workspace tools, permissions, manual compaction, the persistent bottom footer, Ctrl+T
-think cycling, Esc interruption, and unit tests are in place. Skills, MCP, `/init`,
-image input, and a raw-mode line editor with history are not ported yet
-(see [Parity status](#parity-status)).
+workspace tools, permissions, manual compaction, the persistent bottom footer with a
+raw-mode line editor and message queueing, Ctrl+T think cycling, Esc interruption,
+gpt-oss action-tag parsing, and unit tests are in place. Skills, MCP, `/init`,
+and image input are not ported yet (see [Parity status](#parity-status)).
 
 ## Build and run
 
@@ -31,6 +31,54 @@ cargo run
 `OPENAI_MODEL` is required. Point `OPENAI_BASE_URL` at any OpenAI-compatible
 `/v1` endpoint (llama.cpp, Ollama, vLLM, LM Studio, a cloud bridge, ...). The endpoint
 is normalized to `.../chat/completions`; a trailing `/chat/completions` is accepted.
+
+### Running on macOS
+
+RustAgent is portable Rust and builds on Apple silicon and Intel Macs the same way
+as on Linux — the raw-input (`termios`), stdin reader (`tokio::io::unix::AsyncFd`,
+backed by kqueue on macOS), and `run_terminal` (`sh -c`) code paths are all under
+`#[cfg(unix)]`, so no Linux-specific syscall is used.
+
+```sh
+# 1. Install Rust (stable) if you don't have it:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 2. Build:
+cd rustagent
+cargo build --release
+./target/release/rustagent
+```
+
+Then configure a backend. The easiest is local Ollama:
+
+```sh
+# Install Ollama from https://ollama.com (or `brew install ollama`) and start it,
+# then pull a model, e.g.:
+ollama pull qwen3:0.6b
+
+# RustAgent reads config from ~/.config/rustagent/.env (or a project .env):
+mkdir -p ~/.config/rustagent
+cat > ~/.config/rustagent/.env <<'EOF'
+OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+OPENAI_MODEL=qwen3:0.6b
+OPENAI_CONTEXT_WINDOW=65536
+OPENAI_OLLAMA_THINK=low
+TERMINAL_MODE=auto
+EOF
+```
+
+`OPENAI_OLLAMA_THINK` (any of `false`/`low`/`medium`/`high`) routes requests to
+Ollama's native `/api/chat` and is required for the Ctrl+T think-level cycle. Leave
+it unset to use the OpenAI-compatible `/v1/chat/completions` path (needed for cloud
+endpoints without a native Ollama API). See [Configuration](#configuration) for the
+full variable list.
+
+Notes:
+- Verified on Linux in this repo; macOS compiles on the same Unix paths but has not
+  been run end-to-end here. If you hit a macOS-specific issue, report it and it can be
+  fixed in the `#[cfg(unix)]` code.
+- Apple Terminal and iTerm2 both support the truecolor footer and bracketed paste.
+
 
 ### Configuration
 
@@ -123,9 +171,10 @@ is normalized to `.../chat/completions`; a trailing `/chat/completions` is accep
 | Auto-compaction before the context limit | Ported (MinAgent budget + cut point) |
 | `/model` catalog, settings, default persistence | Ported (prefix match; persists to `~/.config/rustagent/.env`) |
 | Markdown terminal rendering | Not ported (raw streamed text) |
-| Persistent footer / line editor / history | Footer ported; raw-mode line editor/history not ported |
+| Persistent footer / line editor / message queue | Ported (truecolor footer, raw-mode editor, queued prompts) |
 | Esc interruption | Ported (cancels streaming and terminal commands) |
 | Build/Plan modes (Tab) | Ported |
+| gpt-oss action-tag tool calls | Ported (parses `<|START_ACTION|>`/`<|START_THINKING|>` text tags) |
 | Skills, MCP, `/init`, image input | Not ported |
 | AGENTS.md loading, evidence ledger | Not ported |
 
@@ -135,11 +184,12 @@ is normalized to `.../chat/completions`; a trailing `/chat/completions` is accep
 cargo test
 ```
 
-44 unit tests cover config parsing, endpoint normalization, token estimates, the `t/s`
+64 unit tests cover config parsing, endpoint normalization, token estimates, the `t/s`
 meter, the footer (scroll-region rows, styled truncation, the processing clock),
-model-default persistence, compaction budget/cut point, SSE/NDJSON parsing, unique
-tool-call ids, tool validation, workspace operations, search, terminal execution, and a
-full streaming round trip against a mock HTTP server (no model required).
+the raw-mode line editor and message queue, model-default persistence, compaction
+budget/cut point, SSE/NDJSON parsing, gpt-oss action-tag parsing, unique tool-call
+ids, tool validation, workspace operations, search, terminal execution, and a full
+streaming round trip against a mock HTTP server (no model required).
 
 ## Notes
 

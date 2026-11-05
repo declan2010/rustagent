@@ -188,6 +188,15 @@ pub struct StreamParser<'a> {
     content_type: String,
     tool_calls: BTreeMap<i64, ToolCall>,
     content: String,
+    // gpt-oss-style models (e.g. north-mini-code) emit tool calls and reasoning
+    // as literal text tags (`<|START_ACTION|>...<|END_ACTION|>`,
+    // `<|START_THINKING|>...<|END_THINKING|>`) inside `content` instead of via
+    // the structured `tool_calls`/`thinking` fields. These fields buffer and
+    // re-route those tags so they never reach the chat as plain text.
+    content_buffer: String,
+    in_thinking: bool,
+    in_action: bool,
+    action_buf: String,
     usage: Option<Usage>,
     finish_reason: Option<String>,
     finished: bool,
@@ -212,6 +221,10 @@ impl<'a> StreamParser<'a> {
             content_type,
             tool_calls: BTreeMap::new(),
             content: String::new(),
+            content_buffer: String::new(),
+            in_thinking: false,
+            in_action: false,
+            action_buf: String::new(),
             usage: None,
             finish_reason: None,
             finished: false,
@@ -223,6 +236,242 @@ impl<'a> StreamParser<'a> {
 
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// The gpt-oss tag markers, kept in one place so the scanner and the
+    /// partial-prefix check stay in sync.
+    const START_THINKING: &'static str = "<|START_THINKING|>";
+    const END_THINKING: &'static str = "<|END_THINKING|>";
+    const START_ACTION: &'static str = "<|START_ACTION|>";
+    const END_ACTION: &'static str = "<|END_ACTION|>";
+
+    /// Routes an incoming `content` delta through the gpt-oss tag filter. Plain
+    /// text is streamed to `on_text`, reasoning tags to `on_reasoning`, and
+    /// action tags are parsed into structured tool calls. A small tail that
+    /// could be the start of a marker is held back until the next chunk.
+    fn process_content(&mut self, text: &str) {
+        self.content_buffer.push_str(text);
+        self.drain_content_buffer();
+    }
+
+    fn drain_content_buffer(&mut self) {
+        let markers: [&'static str; 4] = [
+            Self::START_THINKING,
+            Self::END_THINKING,
+            Self::START_ACTION,
+            Self::END_ACTION,
+        ];
+        loop {
+            if self.in_action {
+                // Accumulate action JSON until the closing tag. Hold back a
+                // tail that might be the start of <|END_ACTION|>.
+                if let Some(pos) = self.content_buffer.find(Self::END_ACTION) {
+                    self.action_buf
+                        .push_str(&self.content_buffer[..pos]);
+                    self.content_buffer = self.content_buffer[pos + Self::END_ACTION.len()..].to_string();
+                    self.in_action = false;
+                    self.finalize_action();
+                } else {
+                    let safe = self.content_buffer
+                        .len()
+                        .saturating_sub(Self::END_ACTION.len() - 1);
+                    let safe = self.safe_cut(&self.content_buffer, safe);
+                    self.action_buf.push_str(&self.content_buffer[..safe]);
+                    self.content_buffer = self.content_buffer[safe..].to_string();
+                    break;
+                }
+                continue;
+            }
+
+            if self.in_thinking {
+                if let Some(pos) = self.content_buffer.find(Self::END_THINKING) {
+                    let head = &self.content_buffer[..pos];
+                    if !head.is_empty() {
+                        (self.on_reasoning)(head);
+                    }
+                    self.content_buffer =
+                        self.content_buffer[pos + Self::END_THINKING.len()..].to_string();
+                    self.in_thinking = false;
+                } else {
+                    let safe = self.content_buffer
+                        .len()
+                        .saturating_sub(Self::END_THINKING.len() - 1);
+                    let safe = self.safe_cut(&self.content_buffer, safe);
+                    if safe > 0 {
+                        (self.on_reasoning)(&self.content_buffer[..safe]);
+                    }
+                    self.content_buffer = self.content_buffer[safe..].to_string();
+                    break;
+                }
+                continue;
+            }
+
+            // Not inside a tag: find the earliest marker.
+            let earliest = markers
+                .iter()
+                .filter_map(|marker| self.content_buffer.find(marker).map(|pos| (pos, *marker)))
+                .min_by_key(|(pos, _)| *pos);
+
+            match earliest {
+                Some((pos, marker)) => {
+                    let head = &self.content_buffer[..pos];
+                    if !head.is_empty() {
+                        self.content.push_str(head);
+                        (self.on_text)(head);
+                    }
+                    self.content_buffer =
+                        self.content_buffer[pos + marker.len()..].to_string();
+                    match marker {
+                        Self::START_THINKING => self.in_thinking = true,
+                        Self::START_ACTION => {
+                            self.in_action = true;
+                            self.action_buf.clear();
+                        }
+                        Self::END_THINKING | Self::END_ACTION => {
+                            // A closing tag without an opening tag: drop it.
+                        }
+                        _ => {}
+                    }
+                }
+                None => {
+                    // No complete marker yet. A marker can only start at `<|`,
+                    // so flush everything except a tail beginning with `<|` that
+                    // is still a prefix of some marker. This keeps plain text
+                    // streaming without the full marker-length delay.
+                    let mut hold = self.content_buffer.len();
+                    for (pos, _) in self.content_buffer.match_indices("<|") {
+                        let tail = &self.content_buffer[pos..];
+                        let forming = [Self::START_THINKING, Self::END_THINKING, Self::START_ACTION, Self::END_ACTION]
+                            .iter()
+                            .any(|marker| marker.starts_with(tail) && tail.len() < marker.len());
+                        if forming {
+                            hold = pos;
+                            break;
+                        }
+                    }
+                    let limit = self.safe_cut(&self.content_buffer, hold);
+                    if limit > 0 {
+                        let head = &self.content_buffer[..limit];
+                        if !head.is_empty() {
+                            self.content.push_str(head);
+                            (self.on_text)(head);
+                        }
+                    }
+                    self.content_buffer = self.content_buffer[limit..].to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Returns the largest cut point `<= limit` that lands on a UTF-8 boundary.
+    fn safe_cut(&self, text: &str, limit: usize) -> usize {
+        if limit >= text.len() {
+            return text.len();
+        }
+        let mut cut = limit;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        cut
+    }
+
+    /// Parses the buffered action JSON into structured tool calls. The gpt-oss
+    /// format is an array of `{tool_call_id, tool_name, parameters}` objects.
+    fn finalize_action(&mut self) {
+        let trimmed = self.action_buf.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        // Some models wrap the array in whitespace/newlines; trim to the JSON.
+        let start = match trimmed.find('[') {
+            Some(index) => index,
+            None => return,
+        };
+        let end = match trimmed.rfind(']') {
+            Some(index) => index,
+            None => return,
+        };
+        let payload = &trimmed[start..=end];
+        let Ok(actions) = serde_json::from_str::<Vec<Value>>(payload) else {
+            // If it is not a valid array, surface it as text so nothing is lost.
+            let text = self.action_buf.clone();
+            self.content.push_str(&text);
+            (self.on_text)(&text);
+            return;
+        };
+        for (position, action) in actions.iter().enumerate() {
+            let index = position as i64;
+            let name = action
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    action
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let parameters = action
+                .get("parameters")
+                .or_else(|| action.get("arguments"))
+                .or_else(|| {
+                    action
+                        .get("function")
+                        .and_then(|function| function.get("arguments"))
+                });
+            let arguments = match parameters {
+                Some(Value::String(text)) => text.clone(),
+                Some(value) => value.to_string(),
+                None => String::new(),
+            };
+            let id = action
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| text.to_string())
+                .unwrap_or_else(|| format!("call_{position}"));
+            let entry = ToolCall {
+                id,
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments,
+                },
+            };
+            self.tool_calls.insert(index, entry);
+            (self.on_tool_call)(name);
+        }
+    }
+
+    /// Flushes any buffered content when the stream ends.
+    pub fn flush_content(&mut self) {
+        if self.in_action {
+            // No closing tag arrived; absorb whatever is still buffered and try
+            // to parse it as the action payload.
+            self.action_buf.push_str(&self.content_buffer);
+            self.content_buffer.clear();
+            self.in_action = false;
+            self.finalize_action();
+            self.action_buf.clear();
+        }
+        if self.in_thinking {
+            let head = std::mem::take(&mut self.content_buffer);
+            if !head.is_empty() {
+                (self.on_reasoning)(&head);
+            }
+            self.in_thinking = false;
+        }
+        if !self.content_buffer.is_empty() {
+            let head = std::mem::take(&mut self.content_buffer);
+            if !head.is_empty() {
+                self.content.push_str(&head);
+                (self.on_text)(&head);
+            }
+        }
     }
 
     pub fn add_bytes(&mut self, count: usize) -> Result<()> {
@@ -285,15 +534,13 @@ impl<'a> StreamParser<'a> {
         if let Some(content) = delta.get("content") {
             if let Some(text) = content.as_str() {
                 if !text.is_empty() {
-                    self.content.push_str(text);
-                    (self.on_text)(text);
+                    self.process_content(text);
                 }
             } else if let Some(parts) = content.as_array() {
                 for part in parts {
                     if let Some(text) = part.get("text").and_then(Value::as_str) {
                         if !text.is_empty() {
-                            self.content.push_str(text);
-                            (self.on_text)(text);
+                            self.process_content(text);
                         }
                     }
                 }
@@ -382,8 +629,7 @@ impl<'a> StreamParser<'a> {
             }
             if let Some(text) = message.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
-                    self.content.push_str(text);
-                    (self.on_text)(text);
+                    self.process_content(text);
                 }
             }
             if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -486,7 +732,8 @@ impl<'a> StreamParser<'a> {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<Completion> {
+    pub fn finish(mut self) -> Result<Completion> {
+        self.flush_content();
         if !self.finished && self.finish_reason.is_none() {
             bail!("[STREAM_ENDED] Endpoint stream ended before a complete response was received.");
         }
@@ -1109,5 +1356,96 @@ mod tests {
         assert_eq!(text, "hi");
         assert_eq!(completion.message.text(), "hi");
         assert_eq!(completion.usage.expect("usage").completion_tokens, 1);
+    }
+
+    #[test]
+    fn gpt_oss_action_tags_become_tool_calls_and_reasoning() {
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut calls = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |chunk: &str| reasoning.push_str(chunk);
+        let mut on_tool_call = |name: &str| calls.push_str(name);
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            true,
+            "application/x-ndjson".to_string(),
+        );
+        // Sent split across several NDJSON lines exactly like a real stream.
+        parser
+            .feed_ndjson_line("{\"message\":{\"content\":\"<|START_THINKING|>remaining \"}}")
+            .unwrap();
+        parser
+            .feed_ndjson_line("{\"message\":{\"content\":\"two pages.<|END_THINKING|><|START_ACTION|>[{\\\"tool_call_id\\\":\\\"21\\\",\\\"tool_name\\\":\\\"write_file\\\",\\\"parameters\\\":{\\\"path\\\":\\\"r.html\\\",\\\"content\\\":\\\"hi\\\"}}]\"}}")
+            .unwrap();
+        parser
+            .feed_ndjson_line("{\"message\":{\"content\":\"<|END_ACTION|>\"}}")
+            .unwrap();
+        parser
+            .feed_ndjson_line("{\"done\":true,\"eval_count\":12,\"prompt_eval_count\":4}")
+            .unwrap();
+        let completion = parser.finish().unwrap();
+        assert_eq!(text, "", "no action text should reach the chat");
+        assert_eq!(reasoning, "remaining two pages.");
+        assert_eq!(completion.message.text(), "");
+        let tool_calls = completion.message.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "21");
+        assert_eq!(tool_calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&tool_calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "r.html");
+        assert_eq!(args["content"], "hi");
+        assert_eq!(calls, "write_file");
+    }
+
+    #[test]
+    fn plain_text_with_stray_angle_prefix_still_streams() {
+        let mut text = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_name: &str| {};
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            false,
+            "text/event-stream".to_string(),
+        );
+        parser
+            .feed_sse_frame("data: {\"choices\":[{\"delta\":{\"content\":\"a < b and c > d\"}}]}")
+            .unwrap();
+        parser.feed_sse_frame("data: [DONE]").unwrap();
+        let completion = parser.finish().unwrap();
+        assert_eq!(completion.message.text(), "a < b and c > d");
+        assert_eq!(text, "a < b and c > d");
+    }
+
+    #[test]
+    fn unclosed_action_is_still_parsed_at_stream_end() {
+        let mut text = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_name: &str| {};
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            true,
+            "application/x-ndjson".to_string(),
+        );
+        // No <|END_ACTION|> arrives; the buffered action should still be parsed.
+        parser
+            .feed_ndjson_line("{\"message\":{\"content\":\"<|START_ACTION|>[{\\\"tool_name\\\":\\\"read_file\\\",\\\"parameters\\\":{\\\"path\\\":\\\"a.txt\\\"}}]\"}}")
+            .unwrap();
+        parser
+            .feed_ndjson_line("{\"done\":true,\"eval_count\":5,\"prompt_eval_count\":2}")
+            .unwrap();
+        let completion = parser.finish().unwrap();
+        assert_eq!(text, "");
+        let tool_calls = completion.message.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(tool_calls[0].function.name, "read_file");
+        assert!(tool_calls[0].function.arguments.contains("a.txt"));
     }
 }
