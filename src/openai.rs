@@ -841,6 +841,9 @@ pub struct Client {
     pub api_key: Option<String>,
     pub model: String,
     pub ollama_think: Option<String>,
+    /// Context window used to set Ollama's `num_ctx` on the native `/api/chat`
+    /// path so long conversations do not get truncated to Ollama's small default.
+    pub context_window: u64,
     http: reqwest::Client,
 }
 
@@ -856,6 +859,7 @@ impl Client {
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             ollama_think: config.ollama_think.clone(),
+            context_window: config.context_window,
             http,
         })
     }
@@ -899,6 +903,11 @@ impl Client {
         if let Some(tools) = tools {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
+        }
+        // On the native /api/chat path, tell Ollama the real context window so
+        // long conversations are not truncated to its small default num_ctx.
+        if native_target.is_some() {
+            body["options"] = json!({ "num_ctx": self.context_window });
         }
 
         let target = native_target.as_deref().unwrap_or(&self.endpoint).to_string();

@@ -563,6 +563,7 @@ impl Agent {
         self.config.model = entry.id.clone();
         self.client.model = entry.id.clone();
         self.config.context_window = context_window;
+        self.client.context_window = context_window;
         self.config.input_modalities = input_modalities;
         self.reset_usage_tracking();
         Ok((known_context, known_input))

@@ -95,6 +95,11 @@ Notes:
 | `SKILLS_MODE` | `off` | Reserved; skills are not ported yet |
 | `MCP_MODE` | `off` | Reserved; MCP is not ported yet |
 
+On the native Ollama path (`OPENAI_OLLAMA_THINK` set), RustAgent sends
+`options.num_ctx = OPENAI_CONTEXT_WINDOW` so long conversations are not truncated
+to Ollama's small default context. Raising the window increases VRAM use; on an
+unstable GPU a smaller window may be safer.
+
 ### Commands
 
 - `/new` — start a new conversation
