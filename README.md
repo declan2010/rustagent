@@ -158,6 +158,11 @@ unstable GPU a smaller window may be safer.
   redraws every ~100 ms while streaming and every second during silent tools, falls
   back to a plain status line when the output is not a TTY, and resets the region on
   exit.
+- GFM table rendering (ported from MinAgent's `markdown-terminal.mjs`): when the model
+  emits a Markdown table (`|` header, separator, body rows), it is buffered and
+  rendered with aligned columns, `│` cell borders, a `─┼─` separator, and a bold
+  cyan header row. Inline Markdown inside cells is stripped. Non-table text still
+  streams raw.
 - Ctrl+T at the prompt cycles the Ollama think level (`off → low → medium → high`),
   mirroring MinAgent; the footer updates immediately and the level applies to the next
   request. Only active for local Ollama endpoints; cooked REPL otherwise.
@@ -178,7 +183,7 @@ unstable GPU a smaller window may be safer.
 | Manual `/compact` | Ported (simple checkpoint; no keep-recent cut tuning) |
 | Auto-compaction before the context limit | Ported (MinAgent budget + cut point) |
 | `/model` catalog, interactive selector, default persistence | Ported (footer panel with ↑/↓/Enter/Esc; prefix match; persists to `~/.config/rustagent/.env`) |
-| Markdown terminal rendering | Not ported (raw streamed text) |
+| Markdown terminal rendering | Partial: GFM tables are aligned with `│` borders and a bold header (ported from MinAgent); other Markdown stays raw |
 | Persistent footer / line editor / message queue | Ported (truecolor footer, raw-mode editor, queued prompts) |
 | Esc interruption | Ported (cancels streaming and terminal commands) |
 | Build/Plan modes (Tab) | Ported |

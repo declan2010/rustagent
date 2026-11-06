@@ -4,6 +4,7 @@ mod context;
 mod footer;
 mod genrate;
 mod input;
+mod markdown;
 mod openai;
 mod prompt;
 mod tools;

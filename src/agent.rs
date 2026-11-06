@@ -8,6 +8,7 @@ use crate::context::{estimate_message_tokens, estimate_messages_tokens, estimate
 use crate::footer::{Footer, ProcessingClock};
 use crate::genrate::{GenerationRate, format_tokens_per_second};
 use crate::input::{self, Input};
+use crate::markdown::MarkdownRenderer;
 use crate::openai::{Client, ModelEntry};
 use crate::prompt::{EditorEvent, Session, Steering};
 use crate::tools::{self, ToolOutcome};
@@ -392,6 +393,7 @@ pub struct Agent {
     running_mode: Option<Mode>,
     last_running_mode: Option<Mode>,
     compacted_summary: String,
+    markdown: RefCell<MarkdownRenderer>,
 }
 
 impl Agent {
@@ -418,6 +420,7 @@ impl Agent {
             running_mode: None,
             last_running_mode: None,
             compacted_summary: String::new(),
+            markdown: RefCell::new(MarkdownRenderer::new()),
         })
     }
 
@@ -904,8 +907,10 @@ impl Agent {
             tracker.borrow_mut().begin();
 
             let completion: Option<std::result::Result<crate::types::Completion, anyhow::Error>> = {
+                self.markdown.borrow_mut().end();
                 let mut on_text = |chunk: &str| {
-                    ui::stream_text(chunk);
+                    self.markdown.borrow_mut().write(chunk);
+                    self.markdown.borrow_mut().flush();
                     tracker.borrow_mut().note_delta(chunk);
                     streamed.push_str(chunk);
                     if footer.should_render() {
@@ -1005,6 +1010,10 @@ impl Agent {
                 };
                 result
             };
+
+            // Flush the renderer for this assistant message (pending table
+            // header, buffered text) before tool calls or the next round.
+            self.markdown.borrow_mut().end();
 
             let completion = match completion {
                 None => {
