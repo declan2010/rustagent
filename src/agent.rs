@@ -672,7 +672,7 @@ impl Agent {
         parts.join(&ui::sep())
     }
 
-    fn footer_status(&self, activity: &str, rate: Option<f64>) -> String {
+    pub fn footer_status(&self, activity: &str, rate: Option<f64>) -> String {
         format!(
             "{}{}",
             self.status_prefix(activity),

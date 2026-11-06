@@ -16,6 +16,7 @@ use std::io::IsTerminal;
 use agent::Agent;
 use footer::Footer;
 use input::Input;
+use openai::ModelEntry;
 use prompt::{EditorEvent, Session};
 
 #[tokio::main]
@@ -254,14 +255,14 @@ async fn handle_input(
             return false;
         }
         "/model" => {
-            handle_model(agent, footer, None).await;
+            handle_model(agent, footer, None, stdin).await;
             println!();
             return false;
         }
         _ => {}
     }
     if let Some(selection) = input.strip_prefix("/model ") {
-        handle_model(agent, footer, Some(selection.trim())).await;
+        handle_model(agent, footer, Some(selection.trim()), stdin).await;
         println!();
         return false;
     }
@@ -283,32 +284,40 @@ async fn handle_input(
     }
 }
 
-async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str>) {
+async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str>, stdin: &mut Input) {
     agent.set_activity(footer, "Loading models", agent.last_rate);
     let catalog = agent.client.list_models().await;
-    agent.set_activity(footer, "Ready", agent.last_rate);
     match selection {
         None => match catalog {
             Ok(models) => {
-                ui::print_info(&format!("Models ({})", models.len()));
-                for (index, entry) in models.iter().enumerate() {
-                    let marker = if entry.id == agent.client.model {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    let context = entry
-                        .context_window
-                        .map(|value| format!("  ~{} ctx", ui::format_number(value)))
-                        .unwrap_or_default();
-                    println!(
-                        " {marker} {:>3}. {}{}",
-                        index + 1,
-                        entry.id,
-                        ui::muted(&context)
-                    );
+                if footer.is_active() && !models.is_empty() {
+                    let picked = select_model_interactive(agent, footer, stdin, models).await;
+                    agent.set_activity(footer, "Ready", agent.last_rate);
+                    footer.clear_panel();
+                    if let Some(entry) = picked {
+                        apply_model_switch(agent, footer, &entry);
+                    }
+                } else {
+                    ui::print_info(&format!("Models ({})", models.len()));
+                    for (index, entry) in models.iter().enumerate() {
+                        let marker = if entry.id == agent.client.model {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        let context = entry
+                            .context_window
+                            .map(|value| format!("  ~{} ctx", ui::format_number(value)))
+                            .unwrap_or_default();
+                        println!(
+                            " {marker} {:>3}. {}{}",
+                            index + 1,
+                            entry.id,
+                            ui::muted(&context)
+                        );
+                    }
+                    println!("{}", ui::dim("Use /model <number|name> to switch."));
                 }
-                println!("{}", ui::dim("Use /model <number|name> to switch."));
             }
             Err(error) => ui::print_error(&error.to_string()),
         },
@@ -327,45 +336,96 @@ async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str
                     return;
                 }
             };
-            if entry.id == agent.client.model {
-                ui::print_info(&format!("Model {} is already selected.", entry.id));
-                return;
-            }
-            match agent.switch_model(&entry) {
-                Ok((known_context, known_input)) => {
-                    println!("{}", ui::success_bold(&format!("Model switched to {}.", entry.id)));
-                    match config::persist_model_default(&entry.id) {
-                        Ok(path) => println!(
-                            "{}",
-                            ui::muted(&format!("· saved as default in {}", path.display()))
-                        ),
-                        Err(error) => println!(
-                            "{}",
-                            ui::warning(&format!("· could not save default: {error}"))
-                        ),
-                    }
-                    if !known_context {
-                        println!(
-                            "{}",
-                            ui::muted(&format!(
-                                "Context size not supplied by the API; using configured {} tokens.",
-                                ui::format_number(agent.config.context_window)
-                            ))
-                        );
-                    }
-                    if !known_input {
-                        println!(
-                            "{}",
-                            ui::muted(&format!(
-                                "Input capabilities not supplied by the API; using configured {}.",
-                                agent.config.input_modalities.join(", ")
-                            ))
-                        );
-                    }
-                    agent.render_ready(footer);
-                }
-                Err(error) => ui::print_error(&error.to_string()),
-            }
+            apply_model_switch(agent, footer, &entry);
         }
+    }
+}
+
+/// Interactive `/model` selector rendered in the footer: arrow keys move the
+/// highlight (wrapping), Enter switches, Esc cancels. Returns the chosen
+/// entry, or `None` on cancel/EOF.
+async fn select_model_interactive(
+    agent: &mut Agent,
+    footer: &Footer,
+    stdin: &mut Input,
+    models: Vec<ModelEntry>,
+) -> Option<ModelEntry> {
+    let current = agent.client.model.clone();
+    let mut selected = models.iter().position(|m| m.id == current).unwrap_or(0);
+    let len = models.len();
+    agent.set_activity(footer, "Select model", agent.last_rate);
+    loop {
+        let columns = ui::terminal_columns();
+        let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+        let panel = ui::model_panel(&ids, &current, selected, columns);
+        let status = agent.footer_status("Select model", agent.last_rate);
+        footer.render_selector(&status, &panel);
+        let Some(byte) = stdin.read_byte().await else {
+            return None;
+        };
+        match byte {
+            0x1b => {
+                if stdin.has_more_in_chunk() {
+                    let b1 = stdin.read_byte().await;
+                    if matches!(b1, Some(b'[')) && stdin.has_more_in_chunk() {
+                        match stdin.read_byte().await {
+                            Some(b'A') => selected = (selected + len - 1) % len,
+                            Some(b'B') => selected = (selected + 1) % len,
+                            _ => {}
+                        }
+                    }
+                } else {
+                    // Lone Esc: cancel.
+                    return None;
+                }
+            }
+            b'\r' | b'\n' => return Some(models[selected].clone()),
+            _ => {}
+        }
+    }
+}
+
+/// Applies a model switch: prints the success notice, persists the default, and
+/// shows the context/input fallback notices. Shared by the interactive selector
+/// and the explicit `/model <selection>` path.
+fn apply_model_switch(agent: &mut Agent, footer: &Footer, entry: &ModelEntry) {
+    if entry.id == agent.client.model {
+        ui::print_info(&format!("Model {} is already selected.", entry.id));
+        return;
+    }
+    match agent.switch_model(entry) {
+        Ok((known_context, known_input)) => {
+            println!("{}", ui::success_bold(&format!("Model switched to {}.", entry.id)));
+            match config::persist_model_default(&entry.id) {
+                Ok(path) => println!(
+                    "{}",
+                    ui::muted(&format!("· saved as default in {}", path.display()))
+                ),
+                Err(error) => println!(
+                    "{}",
+                    ui::warning(&format!("· could not save default: {error}"))
+                ),
+            }
+            if !known_context {
+                println!(
+                    "{}",
+                    ui::muted(&format!(
+                        "Context size not supplied by the API; using configured {} tokens.",
+                        ui::format_number(agent.config.context_window)
+                    ))
+                );
+            }
+            if !known_input {
+                println!(
+                    "{}",
+                    ui::muted(&format!(
+                        "Input capabilities not supplied by the API; using configured {}.",
+                        agent.config.input_modalities.join(", ")
+                    ))
+                );
+            }
+            agent.render_ready(footer);
+        }
+        Err(error) => ui::print_error(&error.to_string()),
     }
 }

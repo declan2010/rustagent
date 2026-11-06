@@ -141,6 +141,11 @@ struct FooterState {
     input_line: String,
     input_cursor: usize,
     queued: usize,
+    /// When non-empty, the footer renders a selection panel (status row + panel
+    /// rows) instead of the hints/input area. Used by the interactive
+    /// `/model` selector.
+    panel: Vec<String>,
+    region_bottom: u16,
 }
 
 pub struct Footer {
@@ -171,6 +176,8 @@ impl Footer {
                 input_line: String::new(),
                 input_cursor: 0,
                 queued: 0,
+                panel: Vec::new(),
+                region_bottom: 0,
             }),
         }
     }
@@ -197,6 +204,7 @@ impl Footer {
             "\x1b[2J\x1b[H\x1b[1;{}r{HIDE_CURSOR}",
             region_bottom(state.rows)
         ));
+        state.region_bottom = region_bottom(state.rows);
         state.initialized = true;
     }
 
@@ -235,6 +243,28 @@ impl Footer {
         self.redraw();
     }
 
+    /// Renders an interactive selection panel (e.g. the `/model` list) in the
+    /// footer area: a status row followed by the given pre-formatted panel
+    /// lines. The normal hints/input area is hidden while the panel is up.
+    pub fn render_selector(&self, status: &str, panel: &[String]) {
+        let mut state = self.state.borrow_mut();
+        state.status = status.to_string();
+        state.panel = panel.to_vec();
+        drop(state);
+        self.redraw();
+    }
+
+    /// Clears the selection panel and restores the standard footer layout.
+    pub fn clear_panel(&self) {
+        let mut state = self.state.borrow_mut();
+        let was_active = !state.panel.is_empty();
+        state.panel.clear();
+        drop(state);
+        if was_active {
+            self.redraw();
+        }
+    }
+
     fn redraw(&self) {
         let mut state = self.state.borrow_mut();
         if !state.active {
@@ -246,6 +276,43 @@ impl Footer {
         }
         let rows = state.rows;
         let columns = state.columns.max(1) as usize;
+
+        // Selection panel mode: status row + panel rows, no hints/input.
+        if !state.panel.is_empty() {
+            let panel_rows = state.panel.len() as u16;
+            let footer_h = 1 + panel_rows;
+            let bottom = rows.saturating_sub(footer_h);
+            let top = bottom + 1;
+            let status = truncate_styled(&state.status, columns);
+            let mut output = String::from(SAVE_CURSOR);
+            if bottom != state.region_bottom {
+                output.push_str(&format!("\x1b[1;{bottom}r"));
+                state.region_bottom = bottom;
+            }
+            output.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[J"));
+            output.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[2K{status}"));
+            for (index, line) in state.panel.iter().enumerate() {
+                let row_number = top + 1 + index as u16;
+                output.push_str(&format!("\x1b[{row_number};1H\x1b[0m\x1b[2K{line}"));
+            }
+            output.push_str(RESTORE_CURSOR);
+            write(&output);
+            state.last_render = Instant::now();
+            return;
+        }
+
+        // Standard layout: restore the scroll region if we were in panel mode.
+        let std_bottom = region_bottom(rows);
+        if state.region_bottom != 0 && state.region_bottom != std_bottom {
+            let mut output = String::from(SAVE_CURSOR);
+            output.push_str(&format!("\x1b[1;{std_bottom}r"));
+            let top = std_bottom + 1;
+            output.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[J"));
+            output.push_str(RESTORE_CURSOR);
+            write(&output);
+            state.region_bottom = std_bottom;
+        }
+
         let top = rows - footer_height(rows) + 1;
         let mut output = String::from(SAVE_CURSOR);
         output.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[J"));
@@ -345,10 +412,9 @@ fn refresh_size(state: &mut FooterState) {
     if !state.initialized {
         return;
     }
-    write(&format!(
-        "\x1b[1;{}r{HIDE_CURSOR}",
-        region_bottom(rows)
-    ));
+    let bottom = region_bottom(rows);
+    write(&format!("\x1b[1;{bottom}r{HIDE_CURSOR}"));
+    state.region_bottom = bottom;
 }
 
 fn with_queued(status: &str, queued: usize) -> String {

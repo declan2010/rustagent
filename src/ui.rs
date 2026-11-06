@@ -95,6 +95,71 @@ pub fn sep() -> String {
     muted(" · ")
 }
 
+/// Reverse-video highlight used for the selected row in a selection panel
+/// (MinAgent's `32;93;112` background with the pale foreground).
+pub fn highlight(text: &str) -> String {
+    if !use_color() {
+        return text.to_string();
+    }
+    format!("\x1b[48;2;32;93;112;38;2;226;239;241m{text}\x1b[0m")
+}
+
+/// Builds the `/model` selection panel: a title, a centered window of up to 5
+/// candidate rows (with a `›` marker and reverse-video highlight on the
+/// selected one), and a footer hint. Mirrors MinAgent's `formatAutocompletePanel`.
+pub fn model_panel(
+    ids: &[String],
+    current_id: &str,
+    selected: usize,
+    columns: usize,
+) -> Vec<String> {
+    const MAX_ITEMS: usize = 5;
+    let total = ids.len();
+    let mut lines: Vec<String> = Vec::with_capacity(MAX_ITEMS + 2);
+    let title = format!(
+        "  ┌─ MODELS · {} match{}",
+        total,
+        if total == 1 { "" } else { "es" }
+    );
+    lines.push(magenta_bold(&title));
+    let first = selected
+        .saturating_sub(MAX_ITEMS / 2)
+        .min(total.saturating_sub(MAX_ITEMS));
+    for visible in 0..MAX_ITEMS {
+        let index = first + visible;
+        if index >= total {
+            lines.push(String::new());
+            continue;
+        }
+        let marker = if index == selected { "›" } else { " " };
+        let mut label = ids[index].clone();
+        if label == current_id {
+            label.push_str(" (current)");
+        }
+        let label = label.chars().filter(|c| !c.is_control()).collect::<String>();
+        let budget = columns.saturating_sub(6).max(1);
+        let mut shown = String::new();
+        let mut width = 0usize;
+        for character in label.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if width + cw > budget {
+                shown.push('…');
+                break;
+            }
+            shown.push(character);
+            width += cw;
+        }
+        let option = format!("  {marker} {shown}");
+        if index == selected {
+            lines.push(highlight(&option));
+        } else {
+            lines.push(muted(&option));
+        }
+    }
+    lines.push(muted("  └─ ↑/↓ select · Enter switch · Esc close"));
+    lines
+}
+
 pub fn terminal_columns() -> usize {
     terminal_size()
         .map(|(Width(width), _)| width as usize)

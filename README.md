@@ -140,14 +140,17 @@ unstable GPU a smaller window may be safer.
   prompt label (`Plan ›` orange / `Build ›` green) switch accordingly, context usage
   is reset, and the footer shows a `Running: Plan/Build` segment when a turn runs in
   a different mode than the selected one.
-- `/model` works like MinAgent's: it fetches the API catalog (`GET /models`), lists
-  identifiers (marking the active one, with context size when the API reports it), and
-  `/model <number|name|prefix>` switches. Selection applies the catalog entry's context
-  window and input modalities when the API supplies them (falling back to the configured
-  defaults), resets context usage, prints fallback notices, and **persists
-  `OPENAI_MODEL=<id>` to `~/.config/rustagent/.env` so the chosen model becomes the
-  default for future sessions. Prefix matching mirrors MinAgent: exact id, else a
-  case-insensitive prefix (`qwen3` → ambiguous list), else error.
+- `/model` works like MinAgent's: it fetches the API catalog (`GET /models`), and with
+  no argument opens an **interactive selector** in the footer — a titled list
+  (`┌─ MODELS · N matches`) with a `›` highlight, **↑/↓** to move, **Enter** to
+  switch, **Esc** to cancel (mirroring MinAgent's `formatAutocompletePanel`).
+  `/model <number|name|prefix>` switches directly. Selection applies the
+  catalog entry's context window and input modalities when the API supplies them
+  (falling back to the configured defaults), resets context usage, prints fallback
+  notices, and **persists `OPENAI_MODEL=<id>` to `~/.config/rustagent/.env` so
+  the chosen model becomes the default for future sessions. Prefix matching
+  mirrors MinAgent: exact id, else a case-insensitive prefix (`qwen3` → ambiguous
+  list), else error. Non-interactive runs fall back to the printed numbered list.
 - Persistent bottom footer (ported from MinAgent's scroll-region renderer): truecolor
   status row with model, think level, token usage and a 10-cell meter, activity,
   cumulative `proc` time, and live/final `t/s`; a hints row ending with the workspace
@@ -174,7 +177,7 @@ unstable GPU a smaller window may be safer.
 | `proc` + `t/s` persistent footer | Ported (truecolor status + hints; non-TTY plain line) |
 | Manual `/compact` | Ported (simple checkpoint; no keep-recent cut tuning) |
 | Auto-compaction before the context limit | Ported (MinAgent budget + cut point) |
-| `/model` catalog, settings, default persistence | Ported (prefix match; persists to `~/.config/rustagent/.env`) |
+| `/model` catalog, interactive selector, default persistence | Ported (footer panel with ↑/↓/Enter/Esc; prefix match; persists to `~/.config/rustagent/.env`) |
 | Markdown terminal rendering | Not ported (raw streamed text) |
 | Persistent footer / line editor / message queue | Ported (truecolor footer, raw-mode editor, queued prompts) |
 | Esc interruption | Ported (cancels streaming and terminal commands) |
