@@ -342,6 +342,96 @@ async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str
     }
 }
 
+/// Terminal-cursor report timeout, matching MinAgent's `readTerminalCursor`.
+const CURSOR_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Asks the terminal for the transcript cursor position: writes a DSR request
+/// (`\x1b[6n`) and parses the `\x1b[<row>;<col>R` reply. Keystrokes that arrive
+/// meanwhile are returned to the input stream (MinAgent's unshift). Returns
+/// `None` when the terminal does not answer in time.
+async fn query_cursor(stdin: &mut Input) -> Option<(u16, u16)> {
+    {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(b"\x1b[6n");
+        let _ = stdout.flush();
+    }
+    let mut collected: Vec<u8> = Vec::new();
+    loop {
+        let byte = match tokio::time::timeout(CURSOR_REPLY_TIMEOUT, stdin.read_byte()).await {
+            Ok(Some(byte)) => byte,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        collected.push(byte);
+        if byte == b'R' {
+            if let Some((position, prefix_len)) = parse_cursor_reply(&collected) {
+                let prefix = &collected[..prefix_len];
+                if !prefix.is_empty() {
+                    stdin.unread(prefix);
+                }
+                return Some(position);
+            }
+        }
+    }
+    if !collected.is_empty() {
+        stdin.unread(&collected);
+    }
+    None
+}
+
+/// Parses a terminal cursor report (`\x1b[<row>;<col>R`) inside a byte buffer,
+/// returning its 1-based position and the byte length before it so any
+/// keystrokes mixed into the same chunk can be replayed.
+fn parse_cursor_reply(bytes: &[u8]) -> Option<((u16, u16), usize)> {
+    for start in 0..bytes.len() {
+        if bytes[start] != 0x1b {
+            continue;
+        }
+        let body = &bytes[start + 1..];
+        if body.first() != Some(&b'[') {
+            continue;
+        }
+
+        let tail_start = start + 2;
+        let mut cursor = tail_start;
+        let mut digits = [0usize; 2];
+        for slot in 0..2 {
+            let begin = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            digits[slot] = cursor - begin;
+            if slot < 1 {
+                if cursor < bytes.len() && bytes[cursor] == b';' {
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if digits[0] == 0 || digits[1] == 0 || cursor >= bytes.len() || bytes[cursor] != b'R'
+            || digits[0] > 5
+            || digits[1] > 5
+        {
+            continue;
+        }
+        let row: u32 = std::str::from_utf8(&bytes[tail_start..tail_start + digits[0]])
+            .ok()?
+            .parse()
+            .ok()?;
+        let column: u32 = std::str::from_utf8(&bytes[tail_start + digits[0] + 1..cursor])
+            .ok()?
+            .parse()
+            .ok()?;
+        if row == 0 || column == 0 || row > u16::MAX as u32 || column > u16::MAX as u32 {
+            continue;
+        }
+        return Some(((row as u16, column as u16), start));
+    }
+    None
+}
+
 /// Interactive `/model` selector rendered in the footer: arrow keys move the
 /// highlight (wrapping), Enter switches, Esc cancels. Returns the chosen
 /// entry, or `None` on cancel/EOF.
@@ -355,12 +445,15 @@ async fn select_model_interactive(
     let mut selected = models.iter().position(|m| m.id == current).unwrap_or(0);
     let len = models.len();
     agent.set_activity(footer, "Select model", agent.last_rate);
+    // The first render shrinks the scroll region; knowing the transcript
+    // cursor lets the footer preserve the rows the taller panel covers.
+    let mut transcript = Some(query_cursor(stdin).await);
     loop {
         let columns = ui::terminal_columns();
         let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
         let panel = ui::model_panel(&ids, &current, selected, columns);
         let status = agent.footer_status("Select model", agent.last_rate);
-        footer.render_selector(&status, &panel);
+        footer.render_selector(&status, &panel, transcript.take().flatten());
         let Some(byte) = stdin.read_byte().await else {
             return None;
         };

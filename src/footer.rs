@@ -145,6 +145,13 @@ struct FooterState {
     /// rows) instead of the hints/input area. Used by the interactive
     /// `/model` selector.
     panel: Vec<String>,
+    /// Whether the panel transition already ran: the scroll region was shrunk
+    /// and the taller footer established.
+    panel_open: bool,
+    /// Transcript cursor (1-based row and column) captured when the panel
+    /// opened, so transcript rows covered by the taller footer can be scrolled
+    /// out of its way (MinAgent's overflow handling).
+    open_transcript: Option<(u16, u16)>,
     region_bottom: u16,
 }
 
@@ -177,6 +184,8 @@ impl Footer {
                 input_cursor: 0,
                 queued: 0,
                 panel: Vec::new(),
+                panel_open: false,
+                open_transcript: None,
                 region_bottom: 0,
             }),
         }
@@ -246,9 +255,16 @@ impl Footer {
     /// Renders an interactive selection panel (e.g. the `/model` list) in the
     /// footer area: a status row followed by the given pre-formatted panel
     /// lines. The normal hints/input area is hidden while the panel is up.
-    pub fn render_selector(&self, status: &str, panel: &[String]) {
+    /// `transcript` is the transcript cursor position (1-based row and column)
+    /// queried by the caller on the first call, used to preserve transcript
+    /// rows the taller footer would otherwise cover.
+    pub fn render_selector(&self, status: &str, panel: &[String], transcript: Option<(u16, u16)>) {
         let mut state = self.state.borrow_mut();
         state.status = status.to_string();
+        if !state.panel_open {
+            state.panel_open = true;
+            state.open_transcript = transcript;
+        }
         state.panel = panel.to_vec();
         drop(state);
         self.redraw();
@@ -257,8 +273,9 @@ impl Footer {
     /// Clears the selection panel and restores the standard footer layout.
     pub fn clear_panel(&self) {
         let mut state = self.state.borrow_mut();
-        let was_active = !state.panel.is_empty();
+        let was_active = state.panel_open || !state.panel.is_empty();
         state.panel.clear();
+        state.panel_open = false;
         drop(state);
         if was_active {
             self.redraw();
@@ -283,13 +300,45 @@ impl Footer {
             let footer_h = 1 + panel_rows;
             let bottom = rows.saturating_sub(footer_h);
             let top = bottom + 1;
-            let status = truncate_styled(&state.status, columns);
-            let mut output = String::from(SAVE_CURSOR);
+
+            // First render in panel mode (or a resize re-entry): erase the
+            // standard footer rows before they join the panel area, scroll
+            // transcript lines that the taller footer would cover up into the
+            // shrunken region (MinAgent's overflow handling), and shrink the
+            // scrolling region (ported from terminal-footer.mjs lines 88-98).
             if bottom != state.region_bottom {
-                output.push_str(&format!("\x1b[1;{bottom}r"));
+                let mut setup = String::new();
+                if state.region_bottom != 0 {
+                    let old_top = state.region_bottom + 1;
+                    setup.push_str(&format!("\x1b[{old_top};1H\x1b[0m\x1b[J"));
+                }
+                if let Some((row, column)) = state.open_transcript.take() {
+                    let row = row.min(rows);
+                    let column = column.max(1).min(columns as u16);
+                    let overflow = row.saturating_sub(bottom);
+                    if overflow > 0 {
+                        // A temporary region that still holds the transcript
+                        // cursor lets the covered content scroll up intact;
+                        // the cursor then follows it (SU keeps the cursor
+                        // still, so reposition it explicitly).
+                        let new_row = row - overflow;
+                        setup.push_str(&format!(
+                            "\x1b[1;{row}r\x1b[{overflow}S\x1b[1;{bottom}r\x1b[{new_row};{column}H"
+                        ));
+                    } else {
+                        setup.push_str(&format!("\x1b[1;{bottom}r"));
+                    }
+                } else {
+                    // No cursor report available: restore without the scroll.
+                    setup.push_str(&format!("\x1b[1;{bottom}r"));
+                }
+                setup.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[J"));
+                write(&setup);
                 state.region_bottom = bottom;
             }
-            output.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[J"));
+
+            let status = truncate_styled(&state.status, columns).to_string();
+            let mut output = String::from(SAVE_CURSOR);
             output.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[2K{status}"));
             for (index, line) in state.panel.iter().enumerate() {
                 let row_number = top + 1 + index as u16;
@@ -304,10 +353,13 @@ impl Footer {
         // Standard layout: restore the scroll region if we were in panel mode.
         let std_bottom = region_bottom(rows);
         if state.region_bottom != 0 && state.region_bottom != std_bottom {
+            let old_top = state.region_bottom + 1;
             let mut output = String::from(SAVE_CURSOR);
+            // Clear the taller (panel) footer before its rows rejoin the
+            // history region so no selector residue stays on screen (ported
+            // from terminal-footer.mjs lines 88-91).
+            output.push_str(&format!("\x1b[{old_top};1H\x1b[0m\x1b[J"));
             output.push_str(&format!("\x1b[1;{std_bottom}r"));
-            let top = std_bottom + 1;
-            output.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[J"));
             output.push_str(RESTORE_CURSOR);
             write(&output);
             state.region_bottom = std_bottom;
@@ -374,7 +426,14 @@ impl Footer {
         let mut output = String::new();
         if state.active {
             let rows = state.rows;
-            let top = rows - footer_height(rows) + 1;
+            // Erase from the current footer's top row: with the panel open the
+            // footer is taller than the standard layout, and leaving its extra
+            // rows behind would drop residue into the shell after exit.
+            let top = if state.region_bottom > 0 {
+                state.region_bottom + 1
+            } else {
+                rows - footer_height(rows) + 1
+            };
             output.push_str(SAVE_CURSOR);
             output.push_str(&format!("\x1b[{top};1H\x1b[0m\x1b[J"));
         }

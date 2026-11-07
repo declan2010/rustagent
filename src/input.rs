@@ -104,9 +104,11 @@ impl Input {
 
     /// Whether the current chunk has more bytes after the one just read. A
     /// newline followed by more bytes is inside a paste; a trailing newline is
-    /// treated as a normal submit.
+    /// treated as a normal submit. Bytes returned by [`Input::unread`] also
+    /// count, so a swallow-and-replay escape sequence is still recognized as
+    /// one keypress instead of a lone Esc.
     pub fn has_more_in_chunk(&self) -> bool {
-        self.pending.is_empty() && !self.current.is_empty()
+        !self.pending.is_empty() || !self.current.is_empty()
     }
 
     /// Returns bytes to the front of the stream so they are not lost.
