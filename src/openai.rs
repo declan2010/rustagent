@@ -844,6 +844,9 @@ pub struct Client {
     /// Context window used to set Ollama's `num_ctx` on the native `/api/chat`
     /// path so long conversations do not get truncated to Ollama's small default.
     pub context_window: u64,
+    /// Models that rejected the `think` option with HTTP 400 ("does not
+    /// support thinking"): subsequent requests for them omit `think`.
+    thinking_disabled: std::sync::Mutex<std::collections::HashSet<String>>,
     http: reqwest::Client,
 }
 
@@ -860,6 +863,7 @@ impl Client {
             model: config.model.clone(),
             ollama_think: config.ollama_think.clone(),
             context_window: config.context_window,
+            thinking_disabled: std::sync::Mutex::new(std::collections::HashSet::new()),
             http,
         })
     }
@@ -894,11 +898,21 @@ impl Client {
             "stream": true
         });
         if let Some(think) = &self.ollama_think {
-            body["think"] = match think.as_str() {
-                "false" => json!(false),
-                "true" => json!(true),
-                other => json!(other),
-            };
+            // A previous attempt provably showed this model cannot think;
+            // do not repeat the rejected option on every request.
+            let disabled = self
+                .thinking_disabled
+                .lock()
+                .ok()
+                .map(|set| set.contains(&self.model))
+                .unwrap_or(false);
+            if !disabled {
+                body["think"] = match think.as_str() {
+                    "false" => json!(false),
+                    "true" => json!(true),
+                    other => json!(other),
+                };
+            }
         }
         if let Some(tools) = tools {
             body["tools"] = json!(tools);
@@ -936,6 +950,24 @@ impl Client {
             {
                 Ok(completion) => return Ok(completion),
                 Err(error) => {
+                    let message = error.to_string();
+                    // Ollama rejects the whole request when `think` is sent to
+                    // a model that cannot think. Retry immediately without it
+                    // and remember the model: this fires at most once because
+                    // the `think` field is gone on the next pass.
+                    if native && message.contains("does not support thinking") && body.get("think").is_some() {
+                        if let Some(object) = body.as_object_mut() {
+                            object.remove("think");
+                        }
+                        if let Ok(mut set) = self.thinking_disabled.lock() {
+                            set.insert(self.model.clone());
+                        }
+                        crate::ui::print_info(&crate::ui::warning(&format!(
+                            "· {} does not support thinking; continuing without it.",
+                            self.model
+                        )));
+                        continue;
+                    }
                     if !is_recoverable_endpoint_error(&error, emitted_deltas.get())
                         || attempt >= ENDPOINT_RECOVERY_DELAYS_MS.len()
                     {
@@ -1480,6 +1512,126 @@ mod tests {
         assert_eq!(completion.message.text(), "hi");
         assert_eq!(completion.usage.expect("usage").completion_tokens, 1);
     }
+
+    /// A model that rejects the `think` option with HTTP 400 must be retried
+    /// once without it, and later requests must omit `think` entirely.
+    #[tokio::test]
+    async fn unsupported_thinking_is_dropped_and_remembered() {
+        use crate::config::PermissionMode;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_bodies = Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            const THINK_REJECT: &str =
+                "{\"error\":\"\\\"ministral-3:14b\\\" does not support thinking\"}";
+            const BODY: &str =
+                "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":3,\"prompt_eval_count\":2}\n";
+            const SECOND: &str =
+                "{\"message\":{\"content\":\"second\"}}\n{\"done\":true,\"eval_count\":3,\"prompt_eval_count\":2}\n";
+            // Request 0 carries think -> 400; request 1 drops it -> success; the
+            // memo must keep request 2 think-less as well.
+            for handled in 0..3u32 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = vec![0u8; 16 * 1024];
+                let count = socket.read(&mut buffer).await.expect("read");
+                let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                let body = request
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let has_think = body.contains("\"think\"");
+                server_bodies.lock().await.push(body);
+                let response = if has_think {
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        THINK_REJECT.len(),
+                        THINK_REJECT
+                    )
+                } else {
+                    let payload = if handled == 2 { SECOND } else { BODY };
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.expect("write");
+            }
+        });
+
+        // ollama_think is set, so the request goes to the native /api/chat path.
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "ministral-3:14b".to_string(),
+            context_window: 8192,
+            timeout_ms: 5_000,
+            ollama_think: Some("true".to_string()),
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        let mut text = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_name: &str| {};
+        let completion = client
+            .complete(
+                &[Message::user("hi")],
+                None,
+                &mut on_text,
+                &mut on_reasoning,
+                &mut on_tool_call,
+            )
+            .await
+            .expect("completion after dropping thinking");
+
+        let bodies_view = bodies.lock().await;
+        assert_eq!(bodies_view.len(), 2, "exactly one retry without thinking");
+        assert!(bodies_view[0].contains("\"think\""), "first attempt sends think");
+        assert!(
+            !bodies_view[1].contains("\"think\""),
+            "retry must not send think; body: {}",
+            bodies_view[1]
+        );
+        assert_eq!(completion.message.text(), "ok");
+        // The session memo persists for further requests: a second call must
+        // immediately succeed with a think-less body and no extra 400.
+        drop(bodies_view);
+        let mut again = String::new();
+        let mut on_text_two = |chunk: &str| again.push_str(chunk);
+        let mut on_reasoning_two = |_chunk: &str| {};
+        let mut on_tool_call_two = |_name: &str| {};
+        let completion_two = client
+            .complete(
+                &[Message::user("hi again")],
+                None,
+                &mut on_text_two,
+                &mut on_reasoning_two,
+                &mut on_tool_call_two,
+            )
+            .await
+            .expect("second call");
+        drop(completion_two);
+        server.await.expect("server task");
+        assert_eq!(again, "second");
+        let bodies_view = bodies.lock().await;
+        assert_eq!(bodies_view.len(), 3, "three requests total, no extra retries");
+        assert!(!bodies_view[2].contains("\"think\""), "memo keeps think off");
+    }
+
 
     #[test]
     fn gpt_oss_action_tags_become_tool_calls_and_reasoning() {
