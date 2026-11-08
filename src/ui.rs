@@ -212,6 +212,12 @@ pub fn format_elapsed(duration: Duration) -> String {
     format!("{}h{:02}m", minutes / 60, minutes % 60)
 }
 
+/// Banner title with the running version, kept in sync with Cargo.toml via
+/// `CARGO_PKG_VERSION`.
+fn banner_title() -> String {
+    format!("RustAgent {} · SESSION", env!("CARGO_PKG_VERSION"))
+}
+
 /// Banner rows for one content line, wrapped to the frame like MinAgent's
 /// `panelLine`: `│ {line}{padding} │` measures inner + 4, same as the edges.
 fn panel_rows(content: &str, color: (u8, u8, u8), inner: usize) -> Vec<String> {
@@ -280,7 +286,7 @@ pub fn print_banner(config: &Config, used_tokens: u64, skills_loaded: usize, mcp
         ));
     }
 
-    let title = "RustAgent · SESSION".to_string();
+    let title = banner_title();
     let contents: Vec<String> = std::iter::once(title.clone())
         .chain(
             rows.iter()
@@ -763,6 +769,14 @@ mod tests {
             out.push(character);
         }
         out
+    }
+
+    #[test]
+    fn banner_title_carries_the_running_version() {
+        assert_eq!(
+            banner_title(),
+            format!("RustAgent {} · SESSION", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

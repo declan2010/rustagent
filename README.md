@@ -4,6 +4,10 @@ A Rust clone of [MinAgent](../MinAgent): a terminal coding agent for OpenAI-comp
 endpoints and Ollama. Same configuration variables, same streaming semantics (SSE and
 Ollama NDJSON), same workspace tools, and the same `proc` / `t/s` status line.
 
+The version from `Cargo.toml` surfaces in the session banner (`RustAgent <version> ·
+SESSION`), in `--version` / `--help`, and drives the update checker, so every
+release identifies itself on startup.
+
 This is **milestone 1** of the port: the core chat loop, streaming parsers, tool loop,
 workspace tools, permissions, manual compaction, the persistent bottom footer with a
 raw-mode line editor and message queueing, Ctrl+T think cycling, Esc interruption,
