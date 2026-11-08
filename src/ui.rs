@@ -224,7 +224,7 @@ fn panel_line(content: &str, color: (u8, u8, u8), inner: usize) {
 }
 
 /// Startup panel, mirroring MinAgent's model/context/input/terminal/workspace rows.
-pub fn print_banner(config: &Config, used_tokens: u64, skills_loaded: usize) {
+pub fn print_banner(config: &Config, used_tokens: u64, skills_loaded: usize, mcp_tools: usize) {
     let window = config.context_window.max(1);
     let percent = used_tokens as f64 / window as f64 * 100.0;
     let mut rows = vec![
@@ -250,14 +250,19 @@ pub fn print_banner(config: &Config, used_tokens: u64, skills_loaded: usize) {
         rows.push((
             "Extensions",
             format!(
-                "Skills {}{} · MCP {}",
+                "Skills {}{} · MCP {}{}",
                 permission_label(config.skills_mode),
                 if config.skills_mode != PermissionMode::Off {
                     format!(" ({skills_loaded} loaded)")
                 } else {
                     String::new()
                 },
-                permission_label(config.mcp_mode)
+                permission_label(config.mcp_mode),
+                if config.mcp_mode != PermissionMode::Off {
+                    format!(" ({mcp_tools} tools)")
+                } else {
+                    String::new()
+                }
             ),
         ));
     }

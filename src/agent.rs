@@ -9,6 +9,7 @@ use crate::footer::{Footer, ProcessingClock};
 use crate::genrate::{GenerationRate, format_tokens_per_second};
 use crate::input::{self, Input};
 use crate::markdown::MarkdownRenderer;
+use crate::mcp;
 use crate::openai::{Client, ModelEntry};
 use crate::prompt::{EditorEvent, Session, Steering};
 use crate::skills;
@@ -127,7 +128,13 @@ fn build_compaction_transcript(messages: &[Message], previous_summary: &str) -> 
     }
 }
 
-fn build_system_prompt(config: &Config, mode: Mode, skill_context: &str) -> String {
+fn build_system_prompt(
+    config: &Config,
+    mode: Mode,
+    skill_context: &str,
+    mcp_active: bool,
+    mcp_context: &str,
+) -> String {
     let mut sections = vec![
         COMMON_PROMPT.to_string(),
         format!(
@@ -155,6 +162,21 @@ fn build_system_prompt(config: &Config, mode: Mode, skill_context: &str) -> Stri
             }
         ));
         sections.push(skill_context.to_string());
+    }
+    if mode == Mode::Build && config.mcp_mode != PermissionMode::Off && mcp_active {
+        sections.push(mcp::MCP_GUIDANCE.to_string());
+        sections.push(format!(
+            "MCP: {}; {}.",
+            config.mcp_mode.as_str(),
+            if config.mcp_mode == PermissionMode::Ask {
+                "approve each call"
+            } else {
+                "no approval required"
+            }
+        ));
+        if !mcp_context.is_empty() {
+            sections.push(mcp_context.to_string());
+        }
     }
     sections.join(" ")
 }
@@ -419,6 +441,9 @@ pub struct Agent {
     pub skills: Vec<skills::Skill>,
     pub skill_context: String,
     pub skill_warnings: Vec<String>,
+    pub mcp: mcp::Connections,
+    pub mcp_context: String,
+    pub mcp_warnings: Vec<String>,
     pub messages: Vec<Message>,
     pub totals: Usage,
     pub last_rate: Option<f64>,
@@ -436,7 +461,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(config: Config) -> Result<Self> {
+    pub async fn new(config: Config) -> Result<Self> {
         let client = Client::new(&config)?;
         // Skill discovery happens once at startup for `auto`/`ask` modes;
         // discovered skills add the load_skill tool and their catalog joins
@@ -454,7 +479,30 @@ impl Agent {
         } else {
             String::new()
         };
-        let system_prompt = build_system_prompt(&config, Mode::Build, &skill_context);
+        // MCP servers connect once at startup for `auto`/`ask` modes; their
+        // tools extend the catalog and server instructions join the prompt.
+        let (mcp_connections, mcp_warnings) = if config.mcp_mode != PermissionMode::Off {
+            let path = mcp::config_path()
+                .unwrap_or_else(|| config.root.join("mcp.json"));
+            let connections = mcp::connect_mcp_servers(&path, &config.root).await;
+            let warnings = connections.warnings.clone();
+            (connections, warnings)
+        } else {
+            (mcp::Connections::empty(), Vec::new())
+        };
+        let mcp_context = if mcp_connections.has_tools_or_guidance() {
+            mcp::format_mcp_context(&mcp_connections.server_guidance)
+        } else {
+            String::new()
+        };
+        tools.extend(mcp_connections.tool_definitions.iter().cloned());
+        let system_prompt = build_system_prompt(
+            &config,
+            Mode::Build,
+            &skill_context,
+            mcp_connections.has_tools_or_guidance(),
+            &mcp_context,
+        );
         let configured_context_window = config.context_window;
         let configured_input_modalities = config.input_modalities.clone();
         Ok(Self {
@@ -464,6 +512,9 @@ impl Agent {
             skills,
             skill_context,
             skill_warnings,
+            mcp: mcp_connections,
+            mcp_context,
+            mcp_warnings,
             messages: vec![Message::system(system_prompt)],
             totals: Usage::default(),
             last_rate: None,
@@ -517,7 +568,13 @@ impl Agent {
     /// compacted-conversation checkpoint.
     fn system_prompt(&self) -> String {
         system_prompt_with_summary(
-            build_system_prompt(&self.config, self.effective_mode(), &self.skill_context),
+            build_system_prompt(
+                &self.config,
+                self.effective_mode(),
+                &self.skill_context,
+                self.mcp.has_tools_or_guidance(),
+                &self.mcp_context,
+            ),
             &self.compacted_summary,
         )
     }
@@ -567,6 +624,12 @@ impl Agent {
             self.refresh_mode_context();
         }
         self.set_activity(footer, "Ready", self.last_rate);
+    }
+
+    /// Closes every connected MCP server (graceful stdio shutdown, HTTP
+    /// session DELETE). Called once after the main loop ends.
+    pub async fn close_mcp(&mut self) {
+        self.mcp.close().await;
     }
 
     pub fn reset(&mut self) {
@@ -1259,7 +1322,23 @@ impl Agent {
                     ));
                     continue;
                 }
-                let current_activity = RefCell::new(tool_activity(&call.function.name));
+                let mcp_entry = {
+                    // Only dispatch MCP names advertised for this request; Plan
+                    // mode filters them out of the catalog up front.
+                    let advertised = request_tools.iter().any(|tool| {
+                        tool.pointer("/function/name").and_then(Value::as_str)
+                            == Some(call.function.name.as_str())
+                    });
+                    if advertised {
+                        self.mcp.lookup(&call.function.name).cloned()
+                    } else {
+                        None
+                    }
+                };
+                let current_activity = RefCell::new(match &mcp_entry {
+                    Some(entry) => format!("MCP {}/{}", entry.server_name, entry.remote_tool_name),
+                    None => tool_activity(&call.function.name),
+                });
                 {
                     let activity = current_activity.borrow().clone();
                     self.set_activity(footer, &activity, self.last_rate);
@@ -1268,7 +1347,38 @@ impl Agent {
                     *current_activity.borrow_mut() = activity.to_string();
                     self.set_activity(footer, activity, self.last_rate);
                 };
-                let outcome: ToolOutcome = {
+                let outcome: ToolOutcome = if let Some(entry) = mcp_entry {
+                    let parsed: Value =
+                        serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+                    let mut approved = true;
+                    if self.config.mcp_mode == PermissionMode::Ask {
+                        on_activity("Approval needed");
+                        let subject = format!("{}/{}", entry.server_name, entry.remote_tool_name);
+                        approved = session
+                            .read_permission(input, footer, "Allow this MCP call? ", &subject)
+                            .await;
+                    }
+                    if !approved {
+                        ToolOutcome {
+                            result: Ok(
+                                "MCP call denied by the user; it was not executed.".to_string()
+                            ),
+                            aborted: false,
+                        }
+                    } else {
+                        on_activity("Running MCP");
+                        match self.mcp.execute(&call.function.name, &parsed).await {
+                            Ok((text, _is_error)) => ToolOutcome {
+                                result: Ok(text),
+                                aborted: false,
+                            },
+                            Err(error) => ToolOutcome {
+                                result: Err(error),
+                                aborted: false,
+                            },
+                        }
+                    }
+                } else {
                     let context = tools::ToolContext {
                         root: &self.config.root,
                         terminal_mode: self.config.terminal_mode,
@@ -1436,15 +1546,15 @@ mod tests {
         let config = skills_config(PermissionMode::Auto);
         let context =
             "Available skills; load relevant instructions as needed:\n- \"demo\": \"A skill\"";
-        let prompt = build_system_prompt(&config, Mode::Build, context);
+        let prompt = build_system_prompt(&config, Mode::Build, context, false, "");
         assert!(prompt.contains("Skills: auto; no approval required."));
         assert!(prompt.contains("- \"demo\": \"A skill\""));
         // Plan mode never advertises skills, matching MinAgent.
-        let plan = build_system_prompt(&config, Mode::Plan, context);
+        let plan = build_system_prompt(&config, Mode::Plan, context, false, "");
         assert!(!plan.contains("Skills:"));
         assert!(!plan.contains("- \"demo\""));
         // Without discovered skills nothing is injected.
-        let empty = build_system_prompt(&config, Mode::Build, "");
+        let empty = build_system_prompt(&config, Mode::Build, "", false, "");
         assert!(!empty.contains("Skills:"));
     }
 
@@ -1453,8 +1563,25 @@ mod tests {
         let config = skills_config(PermissionMode::Ask);
         let context =
             "Available skills; load relevant instructions as needed:\n- \"demo\": \"A skill\"";
-        let prompt = build_system_prompt(&config, Mode::Build, context);
+        let prompt = build_system_prompt(&config, Mode::Build, context, false, "");
         assert!(prompt.contains("Skills: ask; approve each load."));
     }
 
+    #[test]
+    fn build_mode_prompt_carries_the_mcp_section() {
+        let mut config = skills_config(PermissionMode::Auto);
+        config.mcp_mode = PermissionMode::Auto;
+        let guidance = "MCP guidance:\n\n\"demo\":\nBe brief.";
+        let prompt = build_system_prompt(&config, Mode::Build, "", true, guidance);
+        assert!(prompt.contains("Use relevant MCP tools."));
+        assert!(prompt.contains("MCP: auto; no approval required."));
+        assert!(prompt.contains("MCP guidance:"));
+        assert!(prompt.contains("Be brief."));
+        // Plan mode never advertises MCP tools.
+        let plan = build_system_prompt(&config, Mode::Plan, "", true, guidance);
+        assert!(!plan.contains("MCP: auto"));
+        // Inactive connections inject nothing.
+        let inactive = build_system_prompt(&config, Mode::Build, "", false, "");
+        assert!(!inactive.contains("MCP:"));
+    }
 }

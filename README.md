@@ -93,7 +93,7 @@ Notes:
 | `OPENAI_INPUT` | `text,image` | Input modalities |
 | `TERMINAL_MODE` | `ask` | `auto`, `ask`, or `off`; `off` hides `run_terminal` |
 | `SKILLS_MODE` | `off` | `auto`, `ask`, or `off`; discovered `SKILL.md` catalogs enable the `load_skill` tool |
-| `MCP_MODE` | `off` | Reserved; MCP is not ported yet |
+| `MCP_MODE` | `off` | `auto`, `ask`, or `off`; connects the servers in `.rustagent/mcp.json` |
 
 On the native Ollama path (`OPENAI_OLLAMA_THINK` set), RustAgent sends
 `options.num_ctx = OPENAI_CONTEXT_WINDOW` so long conversations are not truncated
@@ -204,6 +204,45 @@ resource, UTF-8 only. In `ask`, each load waits for a `[y/N]` approval in the
 footer; in `auto` it runs directly; `off` (the default) skips discovery and
 hides the tool.
 
+## MCP
+
+When `MCP_MODE` is `auto` or `ask`, rustagent connects the servers configured
+in `~/.config/rustagent/mcp.json` (next to rustagent's `.env`; MinAgent keeps
+its own next to the app under `.minagent/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "env": { },
+      "cwd": "."
+    },
+    "remote": {
+      "url": "https://example.invalid/mcp",
+      "headers": { "Authorization": "Bearer token" }
+    }
+  }
+}
+```
+
+Both transports from MinAgent work: stdio servers (spawned with the configured
+command/args/env/cwd) and streamable-HTTP servers (JSON responses or SSE event
+frames, `Mcp-Session-Id` and `MCP-Protocol-Version` headers, session DELETE on
+exit). Each server goes through the `initialize` handshake (protocol versions
+2024-11-05 through 2025-11-25), pages `tools/list` (up to 32 tools per
+connection), and its instructions join the Build system prompt bounded to
+8 KiB. Advertised functions are named `mcp_<server>_<tool>` with a 64-character
+cap, keep their input schema (8 KiB each, 64 KiB combined), and run through
+`tools/call` with results bounded to 48,000 characters. Limits mirror
+MinAgent: 32 servers, 32 tools, 1 MiB config (regular, unlinked file). In
+`ask`, every call waits for a `[y/N]` approval showing
+`serverName/toolName`; in `auto` calls run directly; `off` (the default) skips
+connection entirely. Plan mode never advertises MCP tools. Server images come
+back as a one-line omission note because rustagent does not attach image parts
+to messages yet.
+
 ## Parity status
 
 | Area | Status |
@@ -222,7 +261,8 @@ hides the tool.
 | Build/Plan modes (Tab) | Ported |
 | gpt-oss action-tag tool calls | Ported (parses `<|START_ACTION|>`/`<|START_THINKING|>` text tags) |
 | Skills discovery and `load_skill` | Ported (`SKILL.md` roots like MinAgent; 24-skill/8 KiB catalog budget; `auto` runs loads, `ask` asks `[y/N]`) |
-| MCP, `/init`, image input | Not ported |
+| MCP client (stdio + HTTP) | Ported (`mcp.json` servers; initialize handshake, paged `tools/list`, `tools/call`; 32-server/32-tool budgets; session DELETE on exit) |
+| `/init`, image input | Not ported |
 | AGENTS.md loading, evidence ledger | Not ported |
 
 ## Tests

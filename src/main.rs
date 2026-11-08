@@ -5,6 +5,7 @@ mod footer;
 mod genrate;
 mod input;
 mod markdown;
+mod mcp;
 mod openai;
 mod prompt;
 mod skills;
@@ -74,7 +75,7 @@ async fn run() -> Result<()> {
     }
 
     let config = config::load()?;
-    let mut agent = Agent::new(config)?;
+    let mut agent = Agent::new(config).await?;
     // Warm the current model's think support up front so Ctrl+T and the
     // request path know its declared states immediately (local Ollama only).
     if agent.is_local_endpoint() && agent.config.ollama_think.is_some() {
@@ -88,8 +89,13 @@ async fn run() -> Result<()> {
     let mut input = Input::spawn();
     let mut session = Session::new(ui::mode_prompt(agent.selected_mode()), interactive);
     session.note_agent_state(agent.selected_mode(), agent.config.ollama_think.clone());
-    ui::print_banner(&agent.config, agent.estimated_tokens(), agent.skills.len());
-    for warning in &agent.skill_warnings {
+    ui::print_banner(
+        &agent.config,
+        agent.estimated_tokens(),
+        agent.skills.len(),
+        agent.mcp.tool_count(),
+    );
+    for warning in agent.skill_warnings.iter().chain(agent.mcp_warnings.iter()) {
         println!(
             "{} {}",
             ui::warning_bold("Feature setup"),
@@ -171,6 +177,7 @@ async fn run() -> Result<()> {
             break;
         }
     }
+    agent.close_mcp().await;
     drop(_raw_guard);
     footer.finish();
     println!();
@@ -301,7 +308,12 @@ async fn handle_input(
         "/new" => {
             agent.reset();
             ui::clear_screen();
-            ui::print_banner(&agent.config, agent.estimated_tokens(), agent.skills.len());
+            ui::print_banner(
+                &agent.config,
+                agent.estimated_tokens(),
+                agent.skills.len(),
+                agent.mcp.tool_count(),
+            );
             agent.render_ready(footer);
             return false;
         }
