@@ -84,7 +84,16 @@ Notes:
 - Apple Terminal and iTerm2 both support the truecolor footer and bracketed paste.
 
 
-### Configuration
+### Releases
+
+Every push to `master` publishes a version automatically (`.github/workflows/release.yml`):
+conventional commits decide the bump — `feat:` (and, before 1.0, breaking changes) bump
+the minor, anything else bumps the patch — then the workflow updates `Cargo.toml` and
+`Cargo.lock`, tags `v<version>`, and creates a GitHub Release listing the commits.
+Releases feed the built-in update checker, which prints a notice when a newer release
+exists.
+
+## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

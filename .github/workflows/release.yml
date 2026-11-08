@@ -1,0 +1,96 @@
+name: release
+
+# Every push to master generates the next version automatically:
+# conventional commits decide the bump (feat/! -> minor in 0.x, fix/chore ->
+# patch), Cargo.toml and Cargo.lock are updated, and a tag plus a GitHub
+# Release are published. Releases feed rustagent's update checker.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Never re-release the bot's own release commit.
+    if: "${{ !startsWith(github.event.head_commit.message, 'chore: release') }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute the next version
+        id: version
+        run: |
+          set -euo pipefail
+          if git tag -l 'v*' | grep -q .; then
+            base_tag="$(git tag -l 'v*' | sort -V | tail -1)"
+            base="${base_tag#v}"
+            range="$base_tag..HEAD"
+          else
+            # No releases yet: the current Cargo.toml version is the base.
+            base="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+            range="HEAD"
+          fi
+          major="${base%%.*}"
+          rest="${base#*.}"
+          minor="${rest%%.*}"
+          patch="${rest##*.}"
+          subjects="$(git log --format=%s "$range")"
+          step=patch
+          if echo "$subjects" | grep -Eq '^[a-z]+(\([^)]*\))?!:'; then
+            # Breaking changes bump major once the project reaches 1.0;
+            # before that they bump minor, like features.
+            if [ "$major" -gt 0 ]; then step=major; else step=minor; fi
+          elif echo "$subjects" | grep -Eq '^feat(\([^)]*\))?:'; then
+            step=minor
+          fi
+          case "$step" in
+            patch) patch=$((patch + 1)) ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+          esac
+          version="$major.$minor.$patch"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+          echo "next version: $base -> $version ($range)"
+
+      - name: Bump Cargo.toml and Cargo.lock
+        run: |
+          python3 - << 'EOF'
+          import re, os
+          version = os.environ["NEXT_VERSION"]
+          manifest = open("Cargo.toml").read()
+          manifest = re.sub(r'(?m)^version = "[^"]*"$', f'version = "{version}"', manifest, count=1)
+          open("Cargo.toml", "w").write(manifest)
+          lock = open("Cargo.lock").read()
+          lock = re.sub(
+              r'(?ms)(name = "rustagent"\nversion = ")[^"]*(")',
+              lambda match: match.group(1) + version + match.group(2),
+              lock,
+              count=1,
+          )
+          open("Cargo.lock", "w").write(lock)
+          print(f"bumped to {version}")
+          EOF
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Commit, tag, and publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          range="${{ steps.version.outputs.range }}"
+          git config user.name "rustagent-release-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -am "chore: release v$version"
+          git tag "v$version"
+          git push origin master --tags
+          notes="$(git log --format='- %s' "$range")"
+          gh release create "v$version" \
+            --title "v$version" \
+            --notes "$(printf 'Automatic release from the commits below.\n\n%s' "$notes")"
