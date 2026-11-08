@@ -366,13 +366,23 @@ fn is_local_endpoint(endpoint: &str) -> bool {
         || endpoint.starts_with("http://[::1]")
 }
 
-/// MinAgent's Ctrl+T cycle: false → low → medium → high → false. Anything
-/// outside the cycle (auto, true, xhigh, max) lands on `false` first.
-pub(crate) fn next_think_level(current: Option<&str>) -> Option<&'static str> {
-    const CYCLE: [&str; 4] = ["false", "low", "medium", "high"];
-    match current.and_then(|value| CYCLE.iter().position(|level| *level == value)) {
-        Some(index) => Some(CYCLE[(index + 1) % CYCLE.len()]),
-        None => Some("false"),
+/// MinAgent's Ctrl+T cycle: false → low → medium → high → false. When the
+/// selected model declares its own think states (from its `/api/show`
+/// snapshot), `allowed` replaces the generic cycle so only states the model
+/// actually supports are offered.
+pub(crate) fn next_think_level(
+    current: Option<&str>,
+    allowed: Option<&[String]>,
+) -> Option<String> {
+    const FALLBACK: [&str; 4] = ["false", "low", "medium", "high"];
+    let fallback: Vec<String> = FALLBACK.iter().map(|level| level.to_string()).collect();
+    let cycle: &[String] = match allowed {
+        Some(states) if !states.is_empty() => states,
+        _ => &fallback,
+    };
+    match current.and_then(|value| cycle.iter().position(|level| level == value)) {
+        Some(index) => Some(cycle[(index + 1) % cycle.len()].clone()),
+        None => Some(cycle.first().cloned().unwrap_or_else(|| "false".to_string())),
     }
 }
 
@@ -620,7 +630,25 @@ impl Agent {
         {
             None => ("think auto".to_string(), ui::muted),
             Some("false") => ("think off".to_string(), ui::success_bold),
-            Some(level) => (format!("think {level}"), ui::warning_bold),
+            Some(state) => {
+                // Reflect what the next request actually does for this model:
+                // a non-thinking model runs off regardless of the configured
+                // level, and a level the template does not declare behaves as
+                // plain "on" (Ollama enables thinking; its own template
+                // default effort applies). Unknown snapshots keep the raw level.
+                match self.client.cached_think_info(&self.config.model) {
+                    Some(info) if !info.has_thinking => ("think off".to_string(), ui::success_bold),
+                    Some(info) if !info.levels.is_empty() => {
+                        if info.levels.iter().any(|declared| declared == state) {
+                            (format!("think {state}"), ui::warning_bold)
+                        } else {
+                            ("think on".to_string(), ui::warning_bold)
+                        }
+                    }
+                    Some(_) => ("think on".to_string(), ui::warning_bold),
+                    None => (format!("think {state}"), ui::warning_bold),
+                }
+            }
         };
         Some(color(&label))
     }
@@ -629,8 +657,18 @@ impl Agent {
         match self.config.ollama_think.as_deref() {
             None => "auto".to_string(),
             Some("false") => "off".to_string(),
+            Some("true") => "on".to_string(),
             Some(level) => level.to_string(),
         }
+    }
+
+    /// The think states the current model supports, straight from the cached
+    /// `/api/show` snapshot (`None` when the snapshot is not available yet,
+    /// e.g. remote endpoints or models never looked up).
+    pub fn think_cycle_allowed(&self) -> Option<Vec<String>> {
+        self.client
+            .cached_think_info(&self.config.model)
+            .map(|info| info.cycle())
     }
 
     fn status_prefix(&self, activity: &str) -> String {
@@ -987,7 +1025,9 @@ impl Agent {
                                     }
                                     EditorEvent::CycleThink => {
                                         if self.is_local_endpoint() {
-                                            let level = session.cycle_steering_think();
+                                            let allowed = self.think_cycle_allowed();
+                                            let level =
+                                                session.cycle_steering_think(allowed.as_deref());
                                             let label = if level == "false" {
                                                 "off"
                                             } else {

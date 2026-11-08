@@ -977,7 +977,7 @@ async fn run_terminal(
                                     io.session.render(io.footer);
                                 }
                                 EditorEvent::CycleThink => {
-                                    let level = io.session.cycle_steering_think();
+                                    let level = io.session.cycle_steering_think(None);
                                     let label = if level == "false" {
                                         "off"
                                     } else {

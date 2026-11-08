@@ -149,6 +149,33 @@ pub fn to_ollama_messages(messages: &[Message]) -> Vec<Value> {
 }
 
 /// Turns an .../v1/chat/completions endpoint into .../api/chat on the same host.
+/// Strips the `/v1/chat/completions` bits of an OpenAI-compatible endpoint and
+/// returns Ollama's root URL (used by the `/api/show` capability lookups).
+/// Returns an empty string when the endpoint has no parseable origin.
+pub fn ollama_base_url(endpoint: &str) -> String {
+    match ollama_chat_url(endpoint) {
+        Some(chat) => chat
+            .trim_end_matches("/api/chat")
+            .trim_end_matches('/')
+            .to_string(),
+        None => String::new(),
+    }
+}
+
+/// Minimal percent-encoding for the `/api/show?model=` fallback query.
+fn urlencode(model: &str) -> String {
+    let mut encoded = String::new();
+    for byte in model.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b':' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
 pub fn ollama_chat_url(endpoint: &str) -> Option<String> {
     let (scheme, rest) = endpoint.split_once("://")?;
     let (authority, path) = match rest.find('/') {
@@ -847,6 +874,15 @@ pub struct Client {
     /// Models that rejected the `think` option with HTTP 400 ("does not
     /// support thinking"): subsequent requests for them omit `think`.
     thinking_disabled: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Ollama `/api/show` snapshots per model: thinking capability, declared
+    /// reasoning-effort levels, native-gguf marker. Populated lazily.
+    think_cache: std::sync::Mutex<std::collections::HashMap<String, ThinkInfo>>,
+    /// Models whose `/api/show` lookup failed once: lookup is not retried, so
+    /// the native `think` logic and the old HTTP 400 recovery remain in charge.
+    show_failed: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// (model, level) pairs whose "Ollama may ignore this level" warning has
+    /// already been printed once.
+    level_warned: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     http: reqwest::Client,
 }
 
@@ -864,6 +900,9 @@ impl Client {
             ollama_think: config.ollama_think.clone(),
             context_window: config.context_window,
             thinking_disabled: std::sync::Mutex::new(std::collections::HashSet::new()),
+            think_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            show_failed: std::sync::Mutex::new(std::collections::HashSet::new()),
+            level_warned: std::sync::Mutex::new(std::collections::HashSet::new()),
             http,
         })
     }
@@ -907,11 +946,27 @@ impl Client {
                 .map(|set| set.contains(&self.model))
                 .unwrap_or(false);
             if !disabled {
-                body["think"] = match think.as_str() {
-                    "false" => json!(false),
-                    "true" => json!(true),
-                    other => json!(other),
-                };
+                // Ask Ollama once (cached) whether this model thinks at all: a
+                // model without the `thinking` capability rejects `think` with
+                // HTTP 400, so never send the option in the first place.
+                if self.model_lacks_thinking().await {
+                    if let Ok(mut set) = self.thinking_disabled.lock() {
+                        set.insert(self.model.clone());
+                    }
+                    crate::ui::print_info(&crate::ui::warning(&format!(
+                        "· {} does not support thinking; continuing without it.",
+                        self.model
+                    )));
+                } else {
+                    body["think"] = match think.as_str() {
+                        "false" => json!(false),
+                        "true" => json!(true),
+                        other => json!(other),
+                    };
+                    if !matches!(think.as_str(), "false" | "true") {
+                        self.warn_unmapped_level(think).await;
+                    }
+                }
             }
         }
         if let Some(tools) = tools {
@@ -1155,6 +1210,166 @@ impl Client {
         models.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(models)
     }
+
+    /// Returns the cached `ThinkInfo` for a model, ignoring `/api/show`
+    /// failures (synchronous, used by the Ctrl+T cycle and the selector).
+    pub fn cached_think_info(&self, model: &str) -> Option<ThinkInfo> {
+        self.think_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(model).cloned())
+    }
+
+    /// Ollama's `/api/show` snapshot for a model, fetched once and cached.
+    /// Failures are remembered (no retry storm); the caller treats `None` as
+    /// "unknown, behave as before".
+    pub async fn think_info_for(&self, model: &str) -> Option<ThinkInfo> {
+        if let Some(info) = self.cached_think_info(model) {
+            return Some(info);
+        }
+        if self
+            .show_failed
+            .lock()
+            .ok()
+            .map(|failed| failed.contains(model))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let base = ollama_base_url(&self.endpoint);
+        if base.is_empty() {
+            return None;
+        }
+        let payload = match self.show_request(&format!("{base}/api/show"), model).await {
+            Some(payload) => Some(payload),
+            None => self
+                .show_request(&format!("{base}/api/show?model={}", urlencode(model)), model)
+                .await,
+        };
+        let Some(payload) = payload else {
+            if let Ok(mut failed) = self.show_failed.lock() {
+                failed.insert(model.to_string());
+            }
+            return None;
+        };
+        let has_thinking = payload
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|capabilities| {
+                capabilities
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|capability| capability == "thinking")
+            })
+            .unwrap_or(false);
+        let template = payload
+            .get("template")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (levels, default_level) = template_think_levels(template);
+        let gguf_arch = payload
+            .get("model_info")
+            .and_then(Value::as_object)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(key, _)| {
+                        key.as_str() == "general.architecture" || key.ends_with(".architecture")
+                    })
+                    .and_then(|(_, value)| value.as_str())
+                    .map(str::to_string)
+            });
+        let info = ThinkInfo {
+            has_thinking,
+            levels,
+            default_level,
+            gguf_arch,
+        };
+        if let Ok(mut cache) = self.think_cache.lock() {
+            cache.insert(model.to_string(), info.clone());
+        }
+        Some(info)
+    }
+
+    async fn show_request(&self, url: &str, model: &str) -> Option<Value> {
+        let mut request = self
+            .http
+            .post(url)
+            .timeout(Duration::from_secs(3))
+            .json(&json!({ "model": model }));
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<Value>().await.ok()
+    }
+
+    /// Whether the model provably cannot think (`thinking` absent from its
+    /// capabilities). Fetches the snapshot on the first call.
+    async fn model_lacks_thinking(&self) -> bool {
+        matches!(
+            self.think_info_for(&self.model).await,
+            Some(info) if !info.has_thinking
+        )
+    }
+
+    /// One-line warning when a template-level is selected for a native GGUF
+    /// import: current Ollama builds may not map it, letting the template
+    /// default (usually the extra-deep one) apply instead. Printed once per
+    /// model and level.
+    async fn warn_unmapped_level(&self, level: &str) {
+        self.think_info_for(&self.model).await;
+        let Some(info) = self.cached_think_info(&self.model) else {
+            return;
+        };
+        if !info.levels.iter().any(|declared| declared == level) {
+            return;
+        }
+        if info.gguf_arch.is_none() {
+            return;
+        }
+        let already = self
+            .level_warned
+            .lock()
+            .ok()
+            .map(|mut warned| !warned.insert((self.model.clone(), level.to_string())))
+            .unwrap_or(true);
+        if already {
+            return;
+        }
+        let fallback = info
+            .default_level
+            .clone()
+            .unwrap_or_else(|| "the template's default".to_string());
+        crate::ui::print_info(&crate::ui::warning(&format!(
+            "· Ollama may ignore think levels for this native model; its template default '{}' applies if unmapped.",
+            fallback
+        )));
+    }
+
+    /// Short per-model annotations for the `/model` selector panel: models
+    /// known to lack the `thinking` capability are marked "(no think)".
+    pub async fn think_notes(&self, ids: &[String]) -> Vec<String> {
+        let futures = ids.iter().map(|model| {
+            let model = model.clone();
+            async move {
+                self.think_info_for(&model)
+                    .await
+                    .map(|info| {
+                        if info.has_thinking {
+                            String::new()
+                        } else {
+                            " (no think)".to_string()
+                        }
+                    })
+                    .unwrap_or_default()
+            }
+        });
+        futures_util::future::join_all(futures).await
+    }
 }
 
 /// A catalog entry from `GET /models`. Optional fields are populated when the
@@ -1168,9 +1383,93 @@ pub struct ModelEntry {
     pub supports_tools: Option<bool>,
 }
 
+/// What Ollama's `/api/show` says about a model's reasoning support.
+///
+/// `has_thinking` comes from the `thinking` capability; `levels` and
+/// `default_level` come from the chat template, which for effort-aware models
+/// (e.g. qwen3.8) declares `reasoning_effort|default('xhigh')` and the accepted
+/// level set. `gguf_arch` is set for native GGUF imports, whose think levels
+/// the current Ollama builds may silently ignore (the template default wins).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThinkInfo {
+    pub has_thinking: bool,
+    pub levels: Vec<String>,
+    pub default_level: Option<String>,
+    pub gguf_arch: Option<String>,
+}
+
+impl ThinkInfo {
+    /// The valid Ctrl+T states for this model: off plus whatever the template
+    /// declares (falling back to plain on/off when no levels are declared).
+    pub fn cycle(&self) -> Vec<String> {
+        if !self.has_thinking {
+            return vec!["false".to_string()];
+        }
+        let mut states = vec!["false".to_string()];
+        if self.levels.is_empty() {
+            states.push("true".to_string());
+        }
+        for level in &self.levels {
+            if !states.contains(level) {
+                states.push(level.clone());
+            }
+        }
+        states
+    }
+}
+
+/// Extracts the declared reasoning-effort levels (and their default) from a
+/// chat template: the `reasoning_effort|default('xhigh')` set clause plus the
+/// `not in ('xhigh', 'medium', 'low')` membership test. Judgment calls are
+/// conservative: only short quoted identifiers next to `reasoning_effort`
+/// count, so unrelated `in (...)` clauses are never picked up.
+fn template_think_levels(template: &str) -> (Vec<String>, Option<String>) {
+    let mut levels: Vec<String> = Vec::new();
+    let mut default_level: Option<String> = None;
+    let mut search = 0usize;
+    while let Some(found) = template[search..].find("reasoning_effort") {
+        let at = search + found;
+        search = at + "reasoning_effort".len();
+        let window = &template[search..(search + 40).min(template.len())];
+        if let Some(offset) = window.find("|default(") {
+            let after = &template[search + offset + "|default(".len()..];
+            default_level = first_quoted_token(after).or(default_level);
+        }
+        let window = &template[search..(search + 160).min(template.len())];
+        if let Some(offset) = window.find("in (") {
+            let after = &template[search + offset + "in (".len()..];
+            if let Some(closing) = after.find(')') {
+                for token in after[..closing].split(',') {
+                    if let Some(value) = first_quoted_token(token) {
+                        if !levels.contains(&value) {
+                            levels.push(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (levels, default_level)
+}
+
+/// Reads a short single-quoted or double-quoted identifier, or nothing.
+fn first_quoted_token(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let quote = trimmed.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let value: String = trimmed[1..].chars().take_while(|&c| c != quote).collect();
+    if value.is_empty() || value.len() > 8 || value.contains('\\') {
+        return None;
+    }
+    Some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::next_think_level;
     use serde_json::json;
 
     fn assistant_with_calls(ids: &[&str]) -> Message {
@@ -1535,13 +1834,26 @@ mod tests {
                 "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":3,\"prompt_eval_count\":2}\n";
             const SECOND: &str =
                 "{\"message\":{\"content\":\"second\"}}\n{\"done\":true,\"eval_count\":3,\"prompt_eval_count\":2}\n";
-            // Request 0 carries think -> 400; request 1 drops it -> success; the
-            // memo must keep request 2 think-less as well.
-            for handled in 0..3u32 {
+            // complete() now probes /api/show before the first chat request;
+            // answer those with 404 so the capabilities stay unknown and the
+            // 400-based recovery flow below runs unchanged. Chat requests:
+            // 0 carries think -> 400; 1 drops it -> success; the memo keeps
+            // request 2 think-less as well.
+            let mut chats = 0u32;
+            loop {
                 let (mut socket, _) = listener.accept().await.expect("accept");
                 let mut buffer = vec![0u8; 16 * 1024];
                 let count = socket.read(&mut buffer).await.expect("read");
                 let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                if request.lines().next().unwrap_or("").contains("/api/show") {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .expect("write probe reply");
+                    continue;
+                }
                 let body = request
                     .split("\r\n\r\n")
                     .nth(1)
@@ -1556,7 +1868,7 @@ mod tests {
                         THINK_REJECT
                     )
                 } else {
-                    let payload = if handled == 2 { SECOND } else { BODY };
+                    let payload = if chats == 2 { SECOND } else { BODY };
                     format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n{}",
                         payload.len(),
@@ -1564,6 +1876,10 @@ mod tests {
                     )
                 };
                 socket.write_all(response.as_bytes()).await.expect("write");
+                chats += 1;
+                if chats == 3 {
+                    break;
+                }
             }
         });
 
@@ -1632,6 +1948,178 @@ mod tests {
         assert!(!bodies_view[2].contains("\"think\""), "memo keeps think off");
     }
 
+    #[test]
+    fn template_think_levels_are_parsed_from_the_chat_template() {
+        let (levels, default) = template_think_levels(concat!(
+            "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n",
+            "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}"
+        ));
+        assert_eq!(
+            levels,
+            &["xhigh".to_string(), "medium".to_string(), "low".to_string()]
+        );
+        assert_eq!(default.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn templates_without_effort_clause_have_no_levels() {
+        let (levels, default) = template_think_levels("{{ Why normal reasoning? |do }}");
+        assert!(levels.is_empty());
+        assert_eq!(default, None);
+    }
+
+    #[test]
+    fn think_info_cycle_respects_declared_levels() {
+        let declared = ThinkInfo {
+            has_thinking: true,
+            levels: vec![
+                "xhigh".to_string(),
+                "medium".to_string(),
+                "low".to_string(),
+            ],
+            default_level: Some("xhigh".to_string()),
+            gguf_arch: Some("qwen35".to_string()),
+        };
+        assert_eq!(
+            declared.cycle(),
+            &[
+                "false".to_string(),
+                "xhigh".to_string(),
+                "medium".to_string(),
+                "low".to_string()
+            ]
+        );
+        let plain = ThinkInfo {
+            has_thinking: true,
+            levels: Vec::new(),
+            default_level: None,
+            gguf_arch: None,
+        };
+        assert_eq!(plain.cycle(), &["false".to_string(), "true".to_string()]);
+        let mute = ThinkInfo {
+            has_thinking: false,
+            levels: Vec::new(),
+            default_level: None,
+            gguf_arch: None,
+        };
+        assert_eq!(mute.cycle(), &["false".to_string()]);
+        // Ctrl+T follows the declared cycle and wraps back to off.
+        assert_eq!(
+            next_think_level(Some("false"), Some(&declared.cycle())),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(
+            next_think_level(Some("low"), Some(&declared.cycle())),
+            Some("false".to_string())
+        );
+    }
+
+    #[test]
+    fn think_cycle_falls_back_to_the_generic_minagent_cycle() {
+        assert_eq!(next_think_level(None, None), Some("false".to_string()));
+        assert_eq!(
+            next_think_level(Some("medium"), None),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            next_think_level(Some("high"), None),
+            Some("false".to_string())
+        );
+    }
+
+    /// A model whose /api/show lacks the thinking capability must never send
+    /// `think`: the request drops it up front instead of waiting for a 400.
+    #[tokio::test]
+    async fn unsupported_capability_suppresses_think_upfront() {
+        use crate::config::PermissionMode;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_bodies = Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            const SHOW: &str =
+                "{\"capabilities\":[\"completion\"],\"template\":\"\"}";
+            const CHAT: &str =
+                "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":1,\"prompt_eval_count\":1}\n";
+            let mut chats = 0u32;
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = vec![0u8; 16 * 1024];
+                let count = socket.read(&mut buffer).await.expect("read");
+                let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                let response = if request.lines().next().unwrap_or("").contains("/api/show") {
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        SHOW.len(),
+                        SHOW
+                    )
+                } else {
+                    server_bodies
+                        .lock()
+                        .await
+                        .push(request.split("\r\n\r\n").nth(1).unwrap_or_default().to_string());
+                    chats += 1;
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n{}",
+                        CHAT.len(),
+                        CHAT
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.expect("write");
+                if chats == 2 {
+                    break;
+                }
+            }
+        });
+
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "qwen-nothink".to_string(),
+            context_window: 8192,
+            timeout_ms: 5_000,
+            ollama_think: Some("low".to_string()),
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        for _call in 0..2u8 {
+            let mut text = String::new();
+            let mut on_text = |chunk: &str| text.push_str(chunk);
+            let mut on_reasoning = |_chunk: &str| {};
+            let mut on_tool_call = |_name: &str| {};
+            let completion = client
+                .complete(
+                    &[Message::user("hi")],
+                    None,
+                    &mut on_text,
+                    &mut on_reasoning,
+                    &mut on_tool_call,
+                )
+                .await
+                .expect("completion");
+            assert_eq!(completion.message.text(), "ok");
+        }
+        server.await.expect("server task");
+        let bodies_view = bodies.lock().await;
+        assert_eq!(bodies_view.len(), 2, "two chat requests, no extra retries");
+        for (index, body) in bodies_view.iter().enumerate() {
+            assert!(
+                !body.contains("\"think\""),
+                "chat {index} must not carry think; body: {body}"
+            );
+        }
+    }
 
     #[test]
     fn gpt_oss_action_tags_become_tool_calls_and_reasoning() {

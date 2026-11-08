@@ -58,7 +58,7 @@ async fn run() -> Result<()> {
         println!("  SKILLS_MODE          auto, ask, or off (default: off)");
         println!("  MCP_MODE             auto, ask, or off (default: off)");
         println!();
-        println!("In an interactive terminal, Ctrl+T cycles the Ollama think level and Tab toggles Build/Plan mode.");
+        println!("In an interactive terminal, Ctrl+T cycles the think states the selected model declares (off, plus its template levels) and Tab toggles Build/Plan mode.");
         return Ok(());
     }
     if arguments
@@ -71,6 +71,11 @@ async fn run() -> Result<()> {
 
     let config = config::load()?;
     let mut agent = Agent::new(config)?;
+    // Warm the current model's think support up front so Ctrl+T and the
+    // request path know its declared states immediately (local Ollama only).
+    if agent.is_local_endpoint() && agent.config.ollama_think.is_some() {
+        agent.client.think_info_for(&agent.config.model).await;
+    }
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let footer = Footer::new();
     footer.init();
@@ -173,8 +178,20 @@ fn cycle_think(agent: &mut Agent, footer: &Footer) {
         ));
         return;
     }
-    let next = agent::next_think_level(agent.config.ollama_think.as_deref());
-    agent.config.ollama_think = next.map(|level| level.to_string());
+    let allowed = agent.think_cycle_allowed();
+    if allowed.as_deref().is_some_and(|states| states.len() <= 1) {
+        // The /api/show snapshot proves the model has no thinking capability.
+        agent.config.ollama_think = Some("false".to_string());
+        agent.client.ollama_think = agent.config.ollama_think.clone();
+        agent.set_activity(footer, "Ready", agent.last_rate);
+        ui::print_info(&ui::warning(&format!(
+            "· {} does not support thinking; thinking stays off.",
+            agent.config.model
+        )));
+        return;
+    }
+    let next = agent::next_think_level(agent.config.ollama_think.as_deref(), allowed.as_deref());
+    agent.config.ollama_think = next;
     agent.client.ollama_think = agent.config.ollama_think.clone();
     agent.set_activity(footer, "Ready", agent.last_rate);
     ui::print_info(&ui::warning(&format!(
@@ -202,14 +219,26 @@ fn on_prompt_action(
             let notice = if !agent.is_local_endpoint() {
                 ui::warning("· Ctrl+T only controls thinking with a local Ollama endpoint.")
             } else {
-                let next = agent::next_think_level(agent.config.ollama_think.as_deref());
-                agent.config.ollama_think = next.map(|level| level.to_string());
-                agent.client.ollama_think = agent.config.ollama_think.clone();
-                agent.set_activity(footer, "Ready", agent.last_rate);
-                ui::warning(&format!(
-                    "· Thinking: {} · applies to the next request.",
-                    agent.think_label_string()
-                ))
+                let allowed = agent.think_cycle_allowed();
+                if allowed.as_deref().is_some_and(|states| states.len() <= 1) {
+                    agent.config.ollama_think = Some("false".to_string());
+                    agent.client.ollama_think = agent.config.ollama_think.clone();
+                    agent.set_activity(footer, "Ready", agent.last_rate);
+                    ui::warning(&format!(
+                        "· {} does not support thinking; thinking stays off.",
+                        agent.config.model
+                    ))
+                } else {
+                    let next =
+                        agent::next_think_level(agent.config.ollama_think.as_deref(), allowed.as_deref());
+                    agent.config.ollama_think = next;
+                    agent.client.ollama_think = agent.config.ollama_think.clone();
+                    agent.set_activity(footer, "Ready", agent.last_rate);
+                    ui::warning(&format!(
+                        "· Thinking: {} · applies to the next request.",
+                        agent.think_label_string()
+                    ))
+                }
             };
             prompt::PromptActionResult {
                 prompt: None,
@@ -296,7 +325,7 @@ async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str
                     agent.set_activity(footer, "Ready", agent.last_rate);
                     footer.clear_panel();
                     if let Some(entry) = picked {
-                        apply_model_switch(agent, footer, &entry);
+                        apply_model_switch(agent, footer, &entry).await;
                     }
                 } else {
                     ui::print_info(&format!("Models ({})", models.len()));
@@ -337,7 +366,7 @@ async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str
                     return;
                 }
             };
-            apply_model_switch(agent, footer, &entry);
+            apply_model_switch(agent, footer, &entry).await;
         }
     }
 }
@@ -451,7 +480,14 @@ async fn select_model_interactive(
     loop {
         let columns = ui::terminal_columns();
         let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-        let panel = ui::model_panel(&ids, &current, selected, columns);
+        // Annotate models that cannot think ("no think"), from Ollama's
+        // /api/show capability snapshots (fetched once, then cached).
+        let notes = if agent.is_local_endpoint() {
+            agent.client.think_notes(&ids).await
+        } else {
+            Vec::new()
+        };
+        let panel = ui::model_panel(&ids, &notes, &current, selected, columns);
         let status = agent.footer_status("Select model", agent.last_rate);
         footer.render_selector(&status, &panel, transcript.take().flatten());
         let Some(byte) = stdin.read_byte().await else {
@@ -480,9 +516,10 @@ async fn select_model_interactive(
 }
 
 /// Applies a model switch: prints the success notice, persists the default, and
-/// shows the context/input fallback notices. Shared by the interactive selector
-/// and the explicit `/model <selection>` path.
-fn apply_model_switch(agent: &mut Agent, footer: &Footer, entry: &ModelEntry) {
+/// shows the context/input fallback notices plus the model's declared think
+/// support. Shared by the interactive selector and the explicit `/model
+/// <selection>` path.
+async fn apply_model_switch(agent: &mut Agent, footer: &Footer, entry: &ModelEntry) {
     if entry.id == agent.client.model {
         ui::print_info(&format!("Model {} is already selected.", entry.id));
         return;
@@ -490,6 +527,32 @@ fn apply_model_switch(agent: &mut Agent, footer: &Footer, entry: &ModelEntry) {
     match agent.switch_model(entry) {
         Ok((known_context, known_input)) => {
             println!("{}", ui::success_bold(&format!("Model switched to {}.", entry.id)));
+            // Look up the model's reasoning support right away so the user
+            // sees which think states are actually valid from now on.
+            let think = agent.client.think_info_for(&entry.id).await;
+            let think_note = match think {
+                Some(info) if !info.has_thinking => Some(
+                    "· thinking is not supported by this model (requests never send `think`.)"
+                        .to_string(),
+                ),
+                Some(info) if info.levels.is_empty() => Some(
+                    "· thinking: plain on/off (the template declares no effort levels.)".to_string(),
+                ),
+                Some(info) => {
+                    let default = info
+                        .default_level
+                        .map(|level| format!(" (template default: {level})"))
+                        .unwrap_or_default();
+                    Some(format!(
+                        "· think levels for this model: {}{default}.",
+                        info.levels.join(", ")
+                    ))
+                }
+                None => None,
+            };
+            if let Some(note) = think_note {
+                println!("{}", ui::muted(&note));
+            }
             match config::persist_model_default(&entry.id) {
                 Ok(path) => println!(
                     "{}",

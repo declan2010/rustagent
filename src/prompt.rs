@@ -517,15 +517,17 @@ impl Session {
         next
     }
 
-    pub fn cycle_steering_think(&mut self) -> String {
+    /// Cycles the queued-`think` override with `EditorEvent::CycleThink`.
+    /// `allowed` limits the cycle to the states the running model supports;
+    /// `None` falls back to the generic MinAgent cycle.
+    pub fn cycle_steering_think(&mut self, allowed: Option<&[String]>) -> String {
         let current = self
             .steering
             .think
             .clone()
             .unwrap_or_else(|| self.think.clone());
-        let next = next_think_level(current.as_deref())
-            .unwrap_or("false")
-            .to_string();
+        let next = next_think_level(current.as_deref(), allowed)
+            .unwrap_or_else(|| "false".to_string());
         self.steering.think = Some(Some(next.clone()));
         next
     }
@@ -1016,7 +1018,7 @@ mod tests {
         session.note_agent_state(Mode::Build, None);
         let mode = session.toggle_steering_mode();
         assert_eq!(mode, Mode::Plan);
-        let think = session.cycle_steering_think();
+        let think = session.cycle_steering_think(None);
         assert_eq!(think, "false");
         session.queue_submission("hello".into());
         let queued = session.pop_queued().unwrap();

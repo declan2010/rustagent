@@ -109,6 +109,7 @@ pub fn highlight(text: &str) -> String {
 /// selected one), and a footer hint. Mirrors MinAgent's `formatAutocompletePanel`.
 pub fn model_panel(
     ids: &[String],
+    notes: &[String],
     current_id: &str,
     selected: usize,
     columns: usize,
@@ -135,6 +136,9 @@ pub fn model_panel(
         let mut label = ids[index].clone();
         if label == current_id {
             label.push_str(" (current)");
+        }
+        if let Some(note) = notes.get(index).filter(|note| !note.is_empty()) {
+            label.push_str(note);
         }
         let label = label.chars().filter(|c| !c.is_control()).collect::<String>();
         let budget = columns.saturating_sub(6).max(1);

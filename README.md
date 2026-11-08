@@ -163,9 +163,18 @@ unstable GPU a smaller window may be safer.
   rendered with aligned columns, `│` cell borders, a `─┼─` separator, and a bold
   cyan header row. Inline Markdown inside cells is stripped. Non-table text still
   streams raw.
-- Ctrl+T at the prompt cycles the Ollama think level (`off → low → medium → high`),
-  mirroring MinAgent; the footer updates immediately and the level applies to the next
-  request. Only active for local Ollama endpoints; cooked REPL otherwise.
+- Ctrl+T at the prompt cycles the think states the selected model actually declares.
+  The model's Ollama `/api/show` snapshot (cached per model) reports the `thinking`
+  capability and the effort levels its chat template declares (`reasoning_effort`,
+  e.g. qwen3.8: `xhigh → medium → low`). Models that cannot think keep thinking off
+  and Ctrl+T says so; models with a plain template cycle `off ↔ on`; models with
+  unknown snapshots use the generic MinAgent cycle (`off → low → medium → high`).
+  The level applies to the next request. Only active for local Ollama endpoints;
+  cooked REPL otherwise. The `/model` selector marks models without the thinking
+  capability as `(no think)`, and switching models prints which levels are valid.
+  Because current Ollama builds may not map think levels for native GGUF models
+  (the template default applies instead), a one-line warning is printed the first
+  time such a level is selected.
 - Esc interrupts the current turn: it cancels the in-flight model stream (or the
   running terminal command, which is killed via `kill_on_drop`), prints
   "Response stopped. You can send a new message.", and returns to `Ready`. Typed-ahead
