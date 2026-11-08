@@ -368,6 +368,39 @@ pub fn print_round_separator() {
 /// MinAgent's `assistantBackground` navy for the model's bubble.
 const ASSISTANT_BACKGROUND: (u8, u8, u8) = (13, 21, 35);
 
+/// Colors for one framed stream block: MinAgent's assistant bubble is a cyan
+/// frame with a magenta title and pale text on the navy background, while the
+/// reasoning frame reuses the exact same geometry fully muted.
+pub struct BubbleStyle {
+    border: (u8, u8, u8),
+    title: (u8, u8, u8),
+    title_bold: bool,
+    text: (u8, u8, u8),
+    background: Option<(u8, u8, u8)>,
+}
+
+impl BubbleStyle {
+    pub fn assistant() -> Self {
+        Self {
+            border: CYAN,
+            title: MAGENTA,
+            title_bold: true,
+            text: PALE,
+            background: Some(ASSISTANT_BACKGROUND),
+        }
+    }
+
+    pub fn thinking() -> Self {
+        Self {
+            border: MUTED,
+            title: MUTED,
+            title_bold: false,
+            text: MUTED,
+            background: None,
+        }
+    }
+}
+
 /// Streams the model's output inside a left-aligned bubble, MinAgent's
 /// `createAssistantBubbleWriter`: cyan frame, label in the title, content on
 /// the navy background word-wrapped to the content width, and a closing line
@@ -376,6 +409,7 @@ const ASSISTANT_BACKGROUND: (u8, u8, u8) = (13, 21, 35);
 pub struct AssistantBubble {
     label: String,
     content_width: usize,
+    style: BubbleStyle,
     opened: bool,
     line_width: usize,
     line_started: bool,
@@ -387,10 +421,17 @@ pub struct AssistantBubble {
 
 impl AssistantBubble {
     pub fn new(label: String) -> Self {
+        Self::with_style(label, BubbleStyle::assistant())
+    }
+
+    /// Builds a bubble with an explicit style; the muted reasoning frame
+    /// reuses the assistant geometry this way.
+    pub fn with_style(label: String, style: BubbleStyle) -> Self {
         let columns = terminal_columns();
         Self {
             label,
             content_width: 8.max(96.min(columns.saturating_sub(4))),
+            style,
             opened: false,
             line_width: 0,
             line_started: false,
@@ -410,9 +451,20 @@ impl AssistantBubble {
     /// fixed content width so wrapping is deterministic.
     #[cfg(test)]
     pub fn with_emit(label: String, emit: Box<dyn FnMut(&str)>, content_width: usize) -> Self {
+        Self::with_emit_style(label, emit, content_width, BubbleStyle::assistant())
+    }
+
+    #[cfg(test)]
+    pub fn with_emit_style(
+        label: String,
+        emit: Box<dyn FnMut(&str)>,
+        content_width: usize,
+        style: BubbleStyle,
+    ) -> Self {
         let mut bubble = Self::new(label);
         bubble.emit = emit;
         bubble.content_width = content_width;
+        bubble.style = style;
         bubble
     }
 
@@ -458,9 +510,13 @@ impl AssistantBubble {
             .max(1);
         (self.emit)(&format!(
             "{}{}{}\n",
-            cyan(footer_prefix),
+            styled(footer_prefix, self.style.border, false),
             muted(&footer_text),
-            cyan(&format!("{}╯", "─".repeat(footer_fill)))
+            styled(
+                &format!("{}╯", "─".repeat(footer_fill)),
+                self.style.border,
+                false
+            )
         ));
         self.opened = false;
     }
@@ -489,9 +545,13 @@ impl AssistantBubble {
             .max(1);
         (self.emit)(&format!(
             "{}{}{}\n",
-            cyan(title_prefix),
-            magenta_bold(&title_text),
-            cyan(&format!("{}╮", "─".repeat(title_fill)))
+            styled(title_prefix, self.style.border, false),
+            styled(&title_text, self.style.title, self.style.title_bold),
+            styled(
+                &format!("{}╮", "─".repeat(title_fill)),
+                self.style.border,
+                false
+            )
         ));
     }
 
@@ -550,15 +610,16 @@ impl AssistantBubble {
             self.line_content.clear();
         }
         let padding = self.content_width.saturating_sub(self.line_width) + 1;
+        let content = format!(" {}{}", self.line_content, " ".repeat(padding));
+        let content = match self.style.background {
+            Some(background) => bubble_text(&content, self.style.text, background),
+            None => styled(&content, self.style.text, false),
+        };
         let row = format!(
             "{}{}{}\n",
-            cyan("│"),
-            bubble_text(
-                &format!(" {}{}", self.line_content, " ".repeat(padding)),
-                PALE,
-                ASSISTANT_BACKGROUND
-            ),
-            cyan("│")
+            styled("│", self.style.border, false),
+            content,
+            styled("│", self.style.border, false)
         );
         (self.emit)(&row);
         self.line_width = 0;
@@ -1011,6 +1072,59 @@ mod assistant_bubble_tests {
             content[2]
         );
         for row in &content {
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(row.as_str()),
+                96 + 4,
+                "misaligned row: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_style_frames_muted_wrapped_rows() {
+        // The reasoning frame reuses the assistant geometry, fully muted and
+        // without a background, and closes with the round status.
+        let rows: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink_rows = Rc::clone(&rows);
+        let mut bubble = AssistantBubble::with_emit_style(
+            "Thinking · test".to_string(),
+            Box::new(move |fragment| {
+                sink_rows.borrow_mut().push(fragment.to_string());
+            }),
+            96,
+            BubbleStyle::thinking(),
+        );
+        bubble.write(&format!(
+            "{} ",
+            "the model rambles on and on here".repeat(6)
+        ));
+        bubble.close("complete");
+        let rows = rows.borrow();
+        assert!(
+            rows.first().expect("title").contains("╭─ Thinking · test"),
+            "title row: {rows:?}"
+        );
+        assert!(
+            rows.last().expect("footer").contains("╰─ complete"),
+            "footer: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("48;2;")),
+            "no background: {rows:?}"
+        );
+        let framed: Vec<String> = rows
+            .iter()
+            .map(|row| plain_row(row))
+            .map(|row| row.trim_end_matches('\n').to_string())
+            .filter(|row| {
+                (row.starts_with('\u{2502}') && row.ends_with('\u{2502}'))
+                    || (row.starts_with("\u{256d}\u{2500}") && row.ends_with('\u{256e}'))
+                    || (row.starts_with("\u{2570}\u{2500}") && row.ends_with('\u{256f}'))
+            })
+            .collect();
+        assert_eq!(framed.len(), rows.len(), "every row framed: {rows:?}");
+        assert!(framed.len() >= 3, "the rambling wraps: {rows:?}");
+        for row in &framed {
             assert_eq!(
                 unicode_width::UnicodeWidthStr::width(row.as_str()),
                 96 + 4,

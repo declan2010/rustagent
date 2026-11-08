@@ -216,8 +216,14 @@ Conversation turns render like MinAgent's chat bubbles:
 - The model's streamed reply renders inside a left-aligned bubble per round
   (cyan frame, navy background): a `╭─ Model · <name>` title, word-wrapped
   markdown output, and a closing `╰─ complete`/`╰─ interrupted`/`╰─ incomplete`
-  status line. Rounds that carry only tool calls open no bubble, reasoning
-  stays muted, and tool results print between the frames.
+  status line. Rounds that carry only tool calls open no bubble and tool
+  results print between the frames.
+- Reasoning streams into its own muted frame (`╭─ Thinking · <name>`) that
+  wraps the thinking at word boundaries and closes with the round status —
+  complete, interrupted, or incomplete — before the answer bubble opens.
+  MinAgent prints thinking as plain muted text; the frame keeps the wall of
+  thinking separated and readable, and reasoning that arrives after the
+  answer started falls back to plain muted output.
 
 ## Skills
 

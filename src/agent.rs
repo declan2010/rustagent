@@ -1145,13 +1145,35 @@ impl Agent {
                         bubble_writer.borrow_mut().write(text);
                     })));
             }
-            // Reasoning prints muted OUTSIDE the bubble; whatever prints next
-            // (the bubble title, a notice) needs the line closed.
+            // The reasoning streams into its own muted frame before the
+            // answer: MinAgent prints thinking as plain muted text, and the
+            // frame keeps the wall of thinking separated, word-wrapped, and
+            // closed with the round status. Reasoning that arrives after the
+            // answer started (rare) falls back to plain muted, and whatever
+            // prints next still needs the line closed.
+            let thinking =
+                std::rc::Rc::new(std::cell::RefCell::new(ui::AssistantBubble::with_style(
+                    format!("Thinking · {}", self.client.model),
+                    ui::BubbleStyle::thinking(),
+                )));
+            let thinking_closed = std::cell::Cell::new(false);
+            let text_seen = std::cell::Cell::new(false);
             let reasoning_open_line = std::cell::Cell::new(false);
 
             let completion: Option<std::result::Result<crate::types::Completion, anyhow::Error>> = {
                 self.markdown.borrow_mut().end();
                 let mut on_text = |chunk: &str| {
+                    if !text_seen.get() {
+                        text_seen.set(true);
+                        // The first answer chunk hands over from the thinking
+                        // frame: close it and leave MinAgent's blank line
+                        // before the assistant bubble opens.
+                        if !thinking_closed.get() {
+                            thinking.borrow_mut().close("complete");
+                            thinking_closed.set(true);
+                            println!();
+                        }
+                    }
                     if reasoning_open_line.get() && !chunk.is_empty() {
                         println!();
                     }
@@ -1166,15 +1188,24 @@ impl Agent {
                     }
                 };
                 let mut on_reasoning = |chunk: &str| {
-                    ui::stream_reasoning(chunk);
-                    reasoning_open_line.set(reasoning_leaves_line_open(chunk));
+                    if thinking_closed.get() {
+                        ui::stream_reasoning(chunk);
+                        reasoning_open_line.set(reasoning_leaves_line_open(chunk));
+                    } else {
+                        thinking.borrow_mut().write(chunk);
+                    }
                     tracker.borrow_mut().note_delta(chunk);
                     if footer.should_render() {
                         let rate = tracker.borrow().live();
                         footer.render(&self.footer_status("Model generating", rate), &hints);
                     }
                 };
-                let mut on_tool_call = |_name: &str| {};
+                let mut on_tool_call = |_name: &str| {
+                    if !thinking_closed.get() {
+                        thinking.borrow_mut().close("complete");
+                        thinking_closed.set(true);
+                    }
+                };
                 let future = self.client.complete(
                     &self.messages,
                     Some(&request_tools),
@@ -1267,6 +1298,10 @@ impl Agent {
 
             let completion = match completion {
                 None => {
+                    if !thinking_closed.get() {
+                        thinking.borrow_mut().close("interrupted");
+                        thinking_closed.set(true);
+                    }
                     bubble.borrow_mut().close("interrupted");
                     self.markdown.borrow_mut().set_sink(None);
                     if reasoning_open_line.get() {
@@ -1279,6 +1314,10 @@ impl Agent {
                     return Ok(());
                 }
                 Some(Ok(completion)) => {
+                    if !thinking_closed.get() {
+                        thinking.borrow_mut().close("complete");
+                        thinking_closed.set(true);
+                    }
                     bubble.borrow_mut().close("complete");
                     self.markdown.borrow_mut().set_sink(None);
                     if reasoning_open_line.get() {
@@ -1287,6 +1326,10 @@ impl Agent {
                     completion
                 }
                 Some(Err(error)) => {
+                    if !thinking_closed.get() {
+                        thinking.borrow_mut().close("incomplete");
+                        thinking_closed.set(true);
+                    }
                     bubble.borrow_mut().close("incomplete");
                     self.markdown.borrow_mut().set_sink(None);
                     if reasoning_open_line.get() {
