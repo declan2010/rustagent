@@ -337,8 +337,11 @@ mod tests {
         assert!(written.contains("OPENAI_MODEL=qwen3:0.6b\n"));
 
         // Existing file with a different model: the line is replaced, others preserved.
-        std::fs::write(&path, "OPENAI_BASE_URL=http://x/v1\nOPENAI_MODEL=old:1b\nOPENAI_API_KEY=k\n")
-            .expect("seed");
+        std::fs::write(
+            &path,
+            "OPENAI_BASE_URL=http://x/v1\nOPENAI_MODEL=old:1b\nOPENAI_API_KEY=k\n",
+        )
+        .expect("seed");
         write_model_default(&path, "qwen3:0.6b").expect("replace");
         let written = std::fs::read_to_string(&path).expect("read");
         let model_lines: Vec<&str> = written

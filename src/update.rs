@@ -98,9 +98,11 @@ mod tests {
     fn garbage_or_prerelease_versions_never_count() {
         assert!(!is_newer("", "0.1.0"));
         assert!(!is_newer("latest", "0.1.0"));
-        assert!(!is_newer("v0.2.0-rc1", "v0.2.0"), "pre-release of the same build");
+        assert!(
+            !is_newer("v0.2.0-rc1", "v0.2.0"),
+            "pre-release of the same build"
+        );
         assert!(!is_newer("", ""));
-
     }
 
     #[test]

@@ -124,7 +124,11 @@ impl ProcessingClock {
 
     pub fn elapsed(&self) -> Duration {
         let state = self.state.borrow();
-        state.accumulated + state.started.map(|started| started.elapsed()).unwrap_or_default()
+        state.accumulated
+            + state
+                .started
+                .map(|started| started.elapsed())
+                .unwrap_or_default()
     }
 }
 
@@ -501,13 +505,7 @@ fn layout_input(prompt: &str, line: &str, cursor: usize, columns: usize) -> Inpu
     let mut rows = vec![String::new()];
     let mut row = 0usize;
     let mut column = 0usize;
-    advance_text(
-        &plain_prompt,
-        columns,
-        &mut rows,
-        &mut row,
-        &mut column,
-    );
+    advance_text(&plain_prompt, columns, &mut rows, &mut row, &mut column);
     advance_text(line, columns, &mut rows, &mut row, &mut column);
 
     // The cursor position is the layout of the text up to the cursor.
@@ -783,10 +781,7 @@ mod tests {
         assert_eq!(layout.rows.len(), 5);
         // The viewport follows the caret so the newest line stays visible.
         let height = input_rows(24) as usize;
-        let first = layout
-            .cursor
-            .0
-            .saturating_sub(height.saturating_sub(1));
+        let first = layout.cursor.0.saturating_sub(height.saturating_sub(1));
         assert_eq!(first, 2);
         assert_eq!(first + height, 5);
     }

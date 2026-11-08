@@ -56,9 +56,7 @@ impl Input {
                                 return;
                             }
                         }
-                        Ok(Err(ref error))
-                            if error.kind() == std::io::ErrorKind::WouldBlock =>
-                        {
+                        Ok(Err(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             continue;
                         }
                         Ok(Err(_)) => break,
