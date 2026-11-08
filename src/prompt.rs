@@ -494,10 +494,6 @@ impl Session {
         self.interactive
     }
 
-    pub fn prompt(&self) -> &str {
-        &self.editor.prompt
-    }
-
     pub fn set_prompt(&mut self, prompt: String) {
         self.editor.set_prompt(prompt);
     }
@@ -551,7 +547,7 @@ impl Session {
         }
         let display = trimmed.to_string();
         let count = self.queue_prompt(text);
-        ui::print_submitted(&self.editor.prompt, &display);
+        ui::print_submitted(&display);
         ui::print_info(&ui::muted(&format!("Queued message · {count} waiting")));
         count
     }

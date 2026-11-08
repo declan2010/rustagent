@@ -346,6 +346,197 @@ pub fn print_round_separator() {
     println!();
 }
 
+/// MinAgent's `assistantBackground` navy for the model's bubble.
+const ASSISTANT_BACKGROUND: (u8, u8, u8) = (13, 21, 35);
+
+/// Streams the model's output inside a left-aligned bubble, MinAgent's
+/// `createAssistantBubbleWriter`: cyan frame, label in the title, content on
+/// the navy background word-wrapped to the content width, and a closing line
+/// carrying the stream status (complete/interrupted/incomplete). The bubble
+/// opens lazily on the first write, so tool-call-only rounds print nothing.
+pub struct AssistantBubble {
+    label: String,
+    content_width: usize,
+    opened: bool,
+    line_width: usize,
+    line_started: bool,
+    line_content: String,
+    pending_word: String,
+    pending_whitespace: String,
+    emit: Box<dyn FnMut(&str)>,
+}
+
+impl AssistantBubble {
+    pub fn new(label: String) -> Self {
+        let columns = terminal_columns();
+        Self {
+            label,
+            content_width: 8.max(96.min(columns.saturating_sub(4))),
+            opened: false,
+            line_width: 0,
+            line_started: false,
+            line_content: String::new(),
+            pending_word: String::new(),
+            pending_whitespace: String::new(),
+            emit: Box::new(|fragment| {
+                use std::io::Write;
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(fragment.as_bytes());
+                let _ = stdout.flush();
+            }),
+        }
+    }
+
+    /// Test constructor that captures rows instead of printing them, with a
+    /// fixed content width so wrapping is deterministic.
+    #[cfg(test)]
+    pub fn with_emit(label: String, emit: Box<dyn FnMut(&str)>, content_width: usize) -> Self {
+        let mut bubble = Self::new(label);
+        bubble.emit = emit;
+        bubble.content_width = content_width;
+        bubble
+    }
+
+    pub fn write(&mut self, text: &str) {
+        if !self.opened {
+            self.open();
+        }
+        for character in text.chars() {
+            if character == '\r' {
+                continue;
+            }
+            if character == '\n' {
+                self.flush_word();
+                self.pending_whitespace.clear();
+                self.finish_line();
+                continue;
+            }
+            if character.is_whitespace() {
+                self.flush_word();
+                self.pending_whitespace.push(character);
+            } else {
+                self.pending_word.push(character);
+            }
+        }
+    }
+
+    /// Closes the bubble with the stream status; never-opened bubbles stay
+    /// silent (tool-call-only rounds print no frame).
+    pub fn close(&mut self, status: &str) {
+        if !self.opened {
+            return;
+        }
+        self.flush_word();
+        self.finish_line();
+        let footer_prefix = "╰─";
+        let footer_text = format!(" {status} ");
+        let footer_fill = self
+            .content_width
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(footer_text.as_str()))
+            .max(1);
+        (self.emit)(&format!(
+            "{}{}{}\n",
+            cyan(footer_prefix),
+            muted(&footer_text),
+            cyan(&format!("{}╯", "─".repeat(footer_fill)))
+        ));
+        self.opened = false;
+    }
+
+    fn open(&mut self) {
+        self.opened = true;
+        let title_prefix = "╭─";
+        let budget = self.content_width.saturating_sub(3).max(5);
+        let mut shown = String::new();
+        let mut used = 0usize;
+        for character in self.label.chars() {
+            let width = character_width(character);
+            if used + width > budget {
+                break;
+            }
+            used += width;
+            shown.push(character);
+        }
+        let title_text = format!(" {shown} ");
+        let fill = self
+            .content_width
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(title_text.as_str()))
+            .max(1);
+        (self.emit)(&format!(
+            "{}{}{}\n",
+            cyan(title_prefix),
+            magenta_bold(&title_text),
+            cyan(&format!("{}╮", "─".repeat(fill)))
+        ));
+    }
+
+    fn flush_word(&mut self) {
+        if self.pending_word.is_empty() {
+            return;
+        }
+        let word_width = self
+            .pending_word
+            .chars()
+            .map(character_width)
+            .sum::<usize>();
+        if word_width > 0 {
+            let whitespace_width = self
+                .pending_whitespace
+                .chars()
+                .map(character_width)
+                .sum::<usize>();
+            if self.line_width > 0
+                && self.line_width + whitespace_width + word_width > self.content_width
+            {
+                self.finish_line();
+                self.pending_whitespace.clear();
+            }
+            self.line_content.push_str(&self.pending_whitespace);
+            self.line_width += whitespace_width;
+            self.pending_whitespace.clear();
+        }
+        let word = std::mem::take(&mut self.pending_word);
+        for character in word.chars() {
+            self.emit_cluster(character);
+        }
+    }
+
+    fn emit_cluster(&mut self, character: char) {
+        let width = character_width(character);
+        if self.line_width > 0 && self.line_width + width > self.content_width {
+            self.finish_line();
+        }
+        if !self.line_started {
+            self.line_started = true;
+            self.line_content.clear();
+        }
+        self.line_content.push(character);
+        self.line_width += width;
+    }
+
+    fn finish_line(&mut self) {
+        if !self.line_started {
+            self.line_started = true;
+            self.line_content.clear();
+        }
+        let padding = self.content_width.saturating_sub(self.line_width) + 1;
+        let row = format!(
+            "{}{}{}\n",
+            cyan("│"),
+            bubble_text(
+                &format!(" {}{}", self.line_content, " ".repeat(padding)),
+                PALE,
+                ASSISTANT_BACKGROUND
+            ),
+            cyan("│")
+        );
+        (self.emit)(&row);
+        self.line_width = 0;
+        self.line_started = false;
+        self.line_content.clear();
+    }
+}
+
 pub fn print_tool_call(name: &str, arguments: &str) {
     let mut preview: String = arguments.chars().take(200).collect();
     if arguments.chars().count() > 200 {
@@ -374,8 +565,135 @@ pub fn print_info(message: &str) {
 }
 
 /// Echoes a submitted prompt above the footer, keeping the transcript readable.
-pub fn print_submitted(prompt: &str, text: &str) {
-    println!("{prompt}{text}");
+/// Echoes the user's submitted message as a right-aligned YOU bubble with a
+/// magenta frame and teal content, matching MinAgent's `printUserBubble`.
+pub fn print_submitted(text: &str) {
+    let (indent, content_width, lines) = user_bubble_geometry(text, terminal_columns());
+    let title = "╭─ YOU ";
+    let title_width = unicode_width::UnicodeWidthStr::width(title);
+    let title_fill = (content_width + 4).saturating_sub(title_width + 1);
+    println!(
+        "{indent}{}{}",
+        magenta_bold(title),
+        magenta(&format!("{}╮", "─".repeat(title_fill)))
+    );
+    for line in &lines {
+        let padding = " ".repeat(
+            content_width.saturating_sub(unicode_width::UnicodeWidthStr::width(line.as_str())),
+        );
+        println!(
+            "{indent}{}{}{}",
+            magenta("│"),
+            bubble_text(&format!(" {line}{padding} "), PALE, USER_BACKGROUND),
+            magenta("│")
+        );
+    }
+    println!(
+        "{indent}{}",
+        magenta(&format!("╰{}╯", "─".repeat(content_width + 2)))
+    );
+}
+
+/// Shared bubble geometry: the right-side indent, the content width, and the
+/// wrapped message lines (the same computation `print_submitted` renders).
+fn user_bubble_geometry(text: &str, columns: usize) -> (String, usize, Vec<String>) {
+    let columns = columns.max(1);
+    let max_content_width = 4.max(66.min(columns.saturating_sub(8)));
+    let lines = wrap_message(text, max_content_width);
+    let content_width = lines
+        .iter()
+        .map(|line| unicode_width::UnicodeWidthStr::width(line.as_str()))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let outer_width = content_width + 4;
+    let indent = " ".repeat(columns.saturating_sub(outer_width));
+    (indent, content_width, lines)
+}
+
+/// MinAgent's `userBackground` teal for the YOU bubble.
+const USER_BACKGROUND: (u8, u8, u8) = (18, 49, 58);
+
+pub fn magenta(text: &str) -> String {
+    styled(text, MAGENTA, false)
+}
+
+/// Foreground on a background cell, MinAgent's `uiBubbleText`.
+fn bubble_text(text: &str, foreground: (u8, u8, u8), background: (u8, u8, u8)) -> String {
+    if !use_color() {
+        return text.to_string();
+    }
+    let (red, green, blue) = foreground;
+    let (back_red, back_green, back_blue) = background;
+    format!("\x1b[38;2;{red};{green};{blue};48;2;{back_red};{back_green};{back_blue}m{text}\x1b[0m")
+}
+
+fn character_width(character: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
+}
+
+/// Word-wraps text like MinAgent's `wrapTextLine`: break at the last space
+/// within the width when possible, hard-break words that do not fit, and trim
+/// each line's trailing whitespace.
+pub fn wrap_message(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        wrap_line(line, width, &mut lines);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn wrap_line(value: &str, width: usize, lines: &mut Vec<String>) {
+    let characters: Vec<char> = value.chars().collect();
+    let widths: Vec<usize> = characters
+        .iter()
+        .map(|character| character_width(*character))
+        .collect();
+    let mut remaining_width: isize = widths.iter().sum::<usize>() as isize;
+    let width = width as isize;
+    let mut start = 0usize;
+    while remaining_width > width {
+        let mut used_width = 0isize;
+        let mut cut = start;
+        let mut last_space: Option<usize> = None;
+        for index in start..characters.len() {
+            let character_width = widths[index] as isize;
+            if used_width + character_width > width {
+                break;
+            }
+            used_width += character_width;
+            cut = index + 1;
+            if characters[index].is_whitespace() {
+                last_space = Some(index);
+            }
+        }
+        let break_at = if cut < characters.len() && characters[cut].is_whitespace() {
+            cut
+        } else if let Some(last_space) = last_space.filter(|at| *at > start) {
+            last_space
+        } else {
+            cut.max(start + 1)
+        };
+        lines.push(
+            characters[start..break_at]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_string(),
+        );
+        let mut next_start = break_at;
+        while next_start < characters.len() && characters[next_start].is_whitespace() {
+            next_start += 1;
+        }
+        for index in start..next_start {
+            remaining_width -= widths[index] as isize;
+        }
+        start = next_start;
+    }
+    lines.push(characters[start..].iter().collect());
 }
 
 pub fn print_help() {
@@ -429,5 +747,124 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(9)), "9s");
         assert_eq!(format_elapsed(Duration::from_secs(83)), "1m23s");
         assert_eq!(format_elapsed(Duration::from_secs(3_723)), "1h02m");
+    }
+}
+
+#[cfg(test)]
+mod ui_bubble_tests {
+    use super::*;
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_hard_breaks_long_words() {
+        let lines = wrap_message("hello world this is rustagent", 11);
+        assert_eq!(
+            lines,
+            vec![
+                "hello world".to_string(),
+                "this is".to_string(),
+                "rustagent".to_string(),
+            ]
+        );
+        let lines = wrap_message("abcdefghij klm", 4);
+        assert_eq!(
+            lines,
+            vec![
+                "abcd".to_string(),
+                "efgh".to_string(),
+                "ij".to_string(),
+                "klm".to_string(),
+            ]
+        );
+        let lines = wrap_message("one\ntwo", 10);
+        assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(wrap_message("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn bubble_geometry_pushes_right_and_keeps_the_frame_closed() {
+        let (indent, content_width, lines) = user_bubble_geometry("hi there", 80);
+        // The frame is outer = content + 4 wide, so the indent is columns - outer.
+        assert_eq!(indent.len(), 80 - (content_width + 4));
+        assert_eq!(lines, vec!["hi there".to_string()]);
+        assert_eq!(content_width, 8);
+        // A long message wraps at 66 content columns max.
+        let long = "word ".repeat(30);
+        let (_, long_width, long_lines) = user_bubble_geometry(&long, 80);
+        assert!(long_width <= 66);
+        assert!(long_lines.len() > 1);
+        // Narrow terminals shrink the content width but keep the frame math;
+        // the bubble never renders narrower than a 4-column content floor.
+        let (narrow_indent, narrow_width, _) = user_bubble_geometry("hi", 20);
+        assert_eq!(narrow_width, 4);
+        assert_eq!(
+            narrow_indent.len(),
+            20usize.saturating_sub(narrow_width + 4)
+        );
+    }
+}
+
+#[cfg(test)]
+mod assistant_bubble_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn captured_bubble(label: &str) -> (AssistantBubble, Rc<RefCell<Vec<String>>>) {
+        let rows: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink_rows = Rc::clone(&rows);
+        let bubble = AssistantBubble::with_emit(
+            label.to_string(),
+            Box::new(move |fragment| {
+                sink_rows.borrow_mut().push(fragment.to_string());
+            }),
+            20,
+        );
+        (bubble, rows)
+    }
+
+    #[test]
+    fn assistant_bubble_frames_and_wraps_streamed_text() {
+        let (mut bubble, rows) = captured_bubble("Model · test");
+        bubble.write("hello world this is a much longer message that must wrap");
+        bubble.close("complete");
+        let rows = rows.borrow();
+        assert!(
+            rows.first().expect("title").contains("╭─ Model · test"),
+            "title row: {rows:?}"
+        );
+        let content: Vec<&String> = rows.iter().filter(|row| row.contains("│")).collect();
+        assert!(content.len() >= 2, "the long message wraps: {rows:?}");
+        let footer = rows.last().expect("footer");
+        assert!(footer.contains("╰─ complete"), "footer: {rows:?}");
+        assert!(footer.contains("╯"));
+    }
+
+    #[test]
+    fn assistant_bubble_opens_lazily_and_silent_when_empty() {
+        let (mut bubble, rows) = captured_bubble("Model · test");
+        bubble.close("complete");
+        assert!(rows.borrow().is_empty(), "no text, no bubble");
+        bubble.write("ok");
+        bubble.close("interrupted");
+        let rows = rows.borrow();
+        assert!(rows.first().expect("title").contains("╭─ Model · test"));
+        assert!(
+            rows.iter().any(|row| row.contains("ok")),
+            "content: {rows:?}"
+        );
+        assert!(
+            rows.last().expect("footer").contains("╰─ interrupted"),
+            "footer: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_bubble_hard_breaks_long_words() {
+        let (mut bubble, rows) = captured_bubble("Model · test");
+        bubble.write("aaaaaaaaaabbbbbbbbbbccccc");
+        bubble.close("complete");
+        let rows = rows.borrow();
+        let content: Vec<&String> = rows.iter().filter(|row| row.contains("│")).collect();
+        assert!(content.len() >= 2, "long word hard-breaks: {rows:?}");
     }
 }

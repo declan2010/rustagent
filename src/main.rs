@@ -166,7 +166,7 @@ async fn run() -> Result<()> {
             continue;
         }
         if !from_queue {
-            ui::print_submitted(session.prompt(), trimmed);
+            ui::print_submitted(trimmed);
         }
         let exited = handle_input(&mut agent, &footer, trimmed, &mut input, &mut session).await;
         agent.apply_steering(&footer, &session.take_steering());

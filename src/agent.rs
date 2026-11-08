@@ -482,8 +482,7 @@ impl Agent {
         // MCP servers connect once at startup for `auto`/`ask` modes; their
         // tools extend the catalog and server instructions join the prompt.
         let (mcp_connections, mcp_warnings) = if config.mcp_mode != PermissionMode::Off {
-            let path = mcp::config_path()
-                .unwrap_or_else(|| config.root.join("mcp.json"));
+            let path = mcp::config_path().unwrap_or_else(|| config.root.join("mcp.json"));
             let connections = mcp::connect_mcp_servers(&path, &config.root).await;
             let warnings = connections.warnings.clone();
             (connections, warnings)
@@ -1076,6 +1075,21 @@ impl Agent {
             let tracker = RefCell::new(GenerationRate::new());
             tracker.borrow_mut().begin();
 
+            // This round's assistant message streams into its own bubble
+            // (MinAgent opens one per round and closes it with the stream
+            // status; tool-call-only rounds never open it).
+            let bubble = std::rc::Rc::new(std::cell::RefCell::new(ui::AssistantBubble::new(
+                format!("Model · {}", self.client.model),
+            )));
+            {
+                let bubble_writer = std::rc::Rc::clone(&bubble);
+                self.markdown
+                    .borrow_mut()
+                    .set_sink(Some(Box::new(move |text| {
+                        bubble_writer.borrow_mut().write(text);
+                    })));
+            }
+
             let completion: Option<std::result::Result<crate::types::Completion, anyhow::Error>> = {
                 self.markdown.borrow_mut().end();
                 let mut on_text = |chunk: &str| {
@@ -1189,20 +1203,22 @@ impl Agent {
 
             let completion = match completion {
                 None => {
-                    if !streamed.is_empty() && !streamed.ends_with('\n') {
-                        println!();
-                    }
+                    bubble.borrow_mut().close("interrupted");
+                    self.markdown.borrow_mut().set_sink(None);
                     ui::print_info(&ui::warning(
                         "Response stopped. You can send a new message.",
                     ));
                     self.ready(footer);
                     return Ok(());
                 }
-                Some(Ok(completion)) => completion,
+                Some(Ok(completion)) => {
+                    bubble.borrow_mut().close("complete");
+                    self.markdown.borrow_mut().set_sink(None);
+                    completion
+                }
                 Some(Err(error)) => {
-                    if !streamed.is_empty() && !streamed.ends_with('\n') {
-                        println!();
-                    }
+                    bubble.borrow_mut().close("incomplete");
+                    self.markdown.borrow_mut().set_sink(None);
                     let message = error.to_string();
                     // A malformed tool call is recoverable: ask the model once or
                     // twice for a complete call instead of ending the turn.
@@ -1219,9 +1235,6 @@ impl Agent {
                     return Err(error);
                 }
             };
-            if !streamed.is_empty() && !streamed.ends_with('\n') {
-                println!();
-            }
             tracker
                 .borrow_mut()
                 .finish(completion.usage.map(|usage| usage.completion_tokens));

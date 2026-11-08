@@ -27,6 +27,7 @@ pub struct MarkdownRenderer {
     widths: Vec<usize>,
     aligns: Vec<Align>,
     out: String,
+    sink: Option<Box<dyn FnMut(&str)>>,
 }
 
 impl MarkdownRenderer {
@@ -39,7 +40,14 @@ impl MarkdownRenderer {
             widths: Vec::new(),
             aligns: Vec::new(),
             out: String::new(),
+            sink: None,
         }
+    }
+
+    /// Routes rendered output to a sink (the assistant bubble) instead of
+    /// stdout. `None` restores direct printing.
+    pub fn set_sink(&mut self, sink: Option<Box<dyn FnMut(&str)>>) {
+        self.sink = sink;
     }
 
     /// Feeds a streamed chunk through the renderer.
@@ -83,16 +91,22 @@ impl MarkdownRenderer {
         self.table_mode = false;
         self.flush_pending_header(false);
         self.flush_out();
+        let sink = self.sink.take();
         *self = Self::new();
+        self.sink = sink;
     }
 
     fn flush_out(&mut self) {
         if self.out.is_empty() {
             return;
         }
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(self.out.as_bytes());
-        let _ = stdout.flush();
+        if let Some(sink) = self.sink.as_mut() {
+            sink(&self.out);
+        } else {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(self.out.as_bytes());
+            let _ = stdout.flush();
+        }
         self.out.clear();
     }
 
@@ -171,11 +185,14 @@ impl MarkdownRenderer {
         let column_count = header.len().max(separator.len());
         let columns = ui::terminal_columns();
         let content_width = 8.max(96.min(columns.saturating_sub(4)));
-        let available_width = column_count.max(content_width.saturating_sub(3 * (column_count - 1)));
+        let available_width =
+            column_count.max(content_width.saturating_sub(3 * (column_count - 1)));
         let minimum_width = 1.max(4.min(available_width / column_count));
         self.widths = (0..column_count)
             .map(|index| {
-                minimum_width.max(visible_width(&format_table_cell(header.get(index).unwrap_or(&String::new()))))
+                minimum_width.max(visible_width(&format_table_cell(
+                    header.get(index).unwrap_or(&String::new()),
+                )))
             })
             .collect();
         let mut total: usize = self.widths.iter().sum();
@@ -257,11 +274,7 @@ impl MarkdownRenderer {
     }
 
     fn render_table_separator(&mut self) {
-        let parts: Vec<String> = self
-            .widths
-            .iter()
-            .map(|width| "─".repeat(*width))
-            .collect();
+        let parts: Vec<String> = self.widths.iter().map(|width| "─".repeat(*width)).collect();
         self.out.push_str(&parts.join("─┼─"));
     }
 }
@@ -315,10 +328,7 @@ fn parse_table_cells(line: &str) -> Vec<String> {
 }
 
 fn is_table_separator(cells: &[String]) -> bool {
-    cells.len() > 1
-        && cells
-            .iter()
-            .all(|cell| separator_regex().is_match(cell))
+    cells.len() > 1 && cells.iter().all(|cell| separator_regex().is_match(cell))
 }
 
 fn separator_regex() -> &'static Regex {
@@ -343,7 +353,13 @@ fn safe_terminal_text(value: &str) -> String {
         .replace("\r\n", "\n")
         .replace("\r", "\n")
         .chars()
-        .filter(|c| !((*c as u32) < 9 || (*c as u32) == 11 || (*c as u32) == 12 || (14..31).contains(&(*c as u32)) || (127..159).contains(&(*c as u32))))
+        .filter(|c| {
+            !((*c as u32) < 9
+                || (*c as u32) == 11
+                || (*c as u32) == 12
+                || (14..31).contains(&(*c as u32))
+                || (127..159).contains(&(*c as u32)))
+        })
         .collect()
 }
 
@@ -398,7 +414,11 @@ fn wrap_table_cell(value: &str, width: usize) -> Vec<String> {
     let mut current = String::new();
     for word in text.split_whitespace() {
         let word_width = visible_width(word);
-        let extra = if line_width > 0 { 1 + word_width } else { word_width };
+        let extra = if line_width > 0 {
+            1 + word_width
+        } else {
+            word_width
+        };
         if line_width > 0 && line_width + extra > width {
             lines.push(current.trim_end().to_string());
             current = String::new();
@@ -429,7 +449,9 @@ mod tests {
 
     #[test]
     fn detects_separator_rows() {
-        assert!(is_table_separator(&parse_table_cells("| --- | :---: | ---: |")));
+        assert!(is_table_separator(&parse_table_cells(
+            "| --- | :---: | ---: |"
+        )));
         assert!(!is_table_separator(&parse_table_cells("| a | b |")));
     }
 
