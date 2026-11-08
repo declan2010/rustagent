@@ -10,6 +10,7 @@ mod prompt;
 mod tools;
 mod types;
 mod ui;
+mod update;
 
 use anyhow::Result;
 use std::io::IsTerminal;
@@ -88,9 +89,31 @@ async fn run() -> Result<()> {
     agent.render_ready(&footer);
     session.render(&footer);
 
+    // Update check: one GitHub request per run, delivered to the loop through
+    // a channel so the result prints after the banner without ever stalling
+    // the prompt or colliding with the footer redraws.
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<String>(1);
+    if interactive {
+        tokio::spawn(async move {
+            let Some(remote) = update::latest_release_tag().await else {
+                return;
+            };
+            let current = env!("CARGO_PKG_VERSION");
+            if update::is_newer(&remote, current) {
+                if let Ok(text) = update::notice(&remote, current) {
+                    let _ = update_tx.send(text).await;
+                }
+            }
+        });
+    }
+
     loop {
         if session.exit_requested() {
             break;
+        }
+        if let Ok(text) = update_rx.try_recv() {
+            println!("{text}");
+            session.render(&footer);
         }
         let (line, from_queue) = if let Some(queued) = session.pop_queued() {
             agent.apply_queued(&footer, queued.mode, queued.think);
