@@ -342,6 +342,13 @@ fn compaction_budget(context_window: u64) -> (u64, u64) {
     (reserve, keep_recent)
 }
 
+/// Whether a reasoning chunk leaves the transcript line open (no trailing
+/// newline): the next print — the bubble title or a notice — must close it
+/// first, mirroring MinAgent's `reasoningOutput.close`.
+fn reasoning_leaves_line_open(chunk: &str) -> bool {
+    !chunk.is_empty() && !chunk.ends_with('\n')
+}
+
 /// Resolves the effective context window against what the model declares:
 /// the declared maximum clamps the configured window down (a model that only
 /// supports 32k never receives a 65k `num_ctx`), and a bigger declaration
@@ -1138,10 +1145,17 @@ impl Agent {
                         bubble_writer.borrow_mut().write(text);
                     })));
             }
+            // Reasoning prints muted OUTSIDE the bubble; whatever prints next
+            // (the bubble title, a notice) needs the line closed.
+            let reasoning_open_line = std::cell::Cell::new(false);
 
             let completion: Option<std::result::Result<crate::types::Completion, anyhow::Error>> = {
                 self.markdown.borrow_mut().end();
                 let mut on_text = |chunk: &str| {
+                    if reasoning_open_line.get() && !chunk.is_empty() {
+                        println!();
+                    }
+                    reasoning_open_line.set(false);
                     self.markdown.borrow_mut().write(chunk);
                     self.markdown.borrow_mut().flush();
                     tracker.borrow_mut().note_delta(chunk);
@@ -1153,6 +1167,7 @@ impl Agent {
                 };
                 let mut on_reasoning = |chunk: &str| {
                     ui::stream_reasoning(chunk);
+                    reasoning_open_line.set(reasoning_leaves_line_open(chunk));
                     tracker.borrow_mut().note_delta(chunk);
                     if footer.should_render() {
                         let rate = tracker.borrow().live();
@@ -1254,6 +1269,9 @@ impl Agent {
                 None => {
                     bubble.borrow_mut().close("interrupted");
                     self.markdown.borrow_mut().set_sink(None);
+                    if reasoning_open_line.get() {
+                        println!();
+                    }
                     ui::print_info(&ui::warning(
                         "Response stopped. You can send a new message.",
                     ));
@@ -1263,11 +1281,17 @@ impl Agent {
                 Some(Ok(completion)) => {
                     bubble.borrow_mut().close("complete");
                     self.markdown.borrow_mut().set_sink(None);
+                    if reasoning_open_line.get() {
+                        println!();
+                    }
                     completion
                 }
                 Some(Err(error)) => {
                     bubble.borrow_mut().close("incomplete");
                     self.markdown.borrow_mut().set_sink(None);
+                    if reasoning_open_line.get() {
+                        println!();
+                    }
                     let message = error.to_string();
                     // A malformed tool call is recoverable: ask the model once or
                     // twice for a complete call instead of ending the turn.
@@ -1675,5 +1699,18 @@ mod context_window_tests {
         assert_eq!(resolve_context_window(65_536, Some(65_536)), (65_536, None));
         assert_eq!(resolve_context_window(65_536, None), (65_536, None));
         assert_eq!(resolve_context_window(65_536, Some(0)), (65_536, None));
+    }
+}
+
+#[cfg(test)]
+mod reasoning_line_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_chunks_report_open_lines() {
+        assert!(reasoning_leaves_line_open("thinking..."));
+        assert!(reasoning_leaves_line_open("line\nmore"));
+        assert!(!reasoning_leaves_line_open("closed\n"));
+        assert!(!reasoning_leaves_line_open(""));
     }
 }
