@@ -430,9 +430,12 @@ impl AssistantBubble {
         self.finish_line();
         let footer_prefix = "╰─";
         let footer_text = format!(" {status} ");
-        let footer_fill = self
-            .content_width
-            .saturating_sub(unicode_width::UnicodeWidthStr::width(footer_text.as_str()))
+        let footer_fill = (self.content_width + 4)
+            .saturating_sub(
+                unicode_width::UnicodeWidthStr::width(footer_prefix)
+                    + unicode_width::UnicodeWidthStr::width(footer_text.as_str())
+                    + 1,
+            )
             .max(1);
         (self.emit)(&format!(
             "{}{}{}\n",
@@ -458,15 +461,18 @@ impl AssistantBubble {
             shown.push(character);
         }
         let title_text = format!(" {shown} ");
-        let fill = self
-            .content_width
-            .saturating_sub(unicode_width::UnicodeWidthStr::width(title_text.as_str()))
+        let title_fill = (self.content_width + 4)
+            .saturating_sub(
+                unicode_width::UnicodeWidthStr::width(title_prefix)
+                    + unicode_width::UnicodeWidthStr::width(title_text.as_str())
+                    + 1,
+            )
             .max(1);
         (self.emit)(&format!(
             "{}{}{}\n",
             cyan(title_prefix),
             magenta_bold(&title_text),
-            cyan(&format!("{}╮", "─".repeat(fill)))
+            cyan(&format!("{}╮", "─".repeat(title_fill)))
         ));
     }
 
@@ -485,14 +491,19 @@ impl AssistantBubble {
                 .chars()
                 .map(character_width)
                 .sum::<usize>();
+            // A wrap discards the whitespace that preceded the word, so it
+            // must not count towards the new line's width either; carrying
+            // it over left the wrapped row one column short of the frame.
+            let mut carried_whitespace = whitespace_width;
             if self.line_width > 0
                 && self.line_width + whitespace_width + word_width > self.content_width
             {
                 self.finish_line();
                 self.pending_whitespace.clear();
+                carried_whitespace = 0;
             }
             self.line_content.push_str(&self.pending_whitespace);
-            self.line_width += whitespace_width;
+            self.line_width += carried_whitespace;
             self.pending_whitespace.clear();
         }
         let word = std::mem::take(&mut self.pending_word);
@@ -856,6 +867,81 @@ mod assistant_bubble_tests {
             rows.last().expect("footer").contains("╰─ interrupted"),
             "footer: {rows:?}"
         );
+    }
+
+    /// Strips ANSI color codes so captured rows can be measured by column.
+    fn plain_row(row: &str) -> String {
+        let mut out = String::new();
+        let mut chars = row.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(character);
+        }
+        out
+    }
+
+    #[test]
+    fn assistant_bubble_wrapped_rows_align_with_the_frame() {
+        // A wrap discards the whitespace that led the wrapped word; that
+        // discarded width used to leak into the padding and pulled the
+        // right border one column short on exactly the wrapped rows.
+        let rows: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink_rows = Rc::clone(&rows);
+        let mut bubble = AssistantBubble::with_emit(
+            "Model · test".to_string(),
+            Box::new(move |fragment| {
+                sink_rows.borrow_mut().push(fragment.to_string());
+            }),
+            96,
+        );
+        bubble.write(
+            "**Phases written:** shared data layer \u{2192} navigation shell + CSS \u{2192} categories \
+             \u{2192} products \u{2192} movements \u{2192} stock/min alerts \u{2192} reports \u{2192} \
+             inventory value.\n",
+        );
+        bubble.close("complete");
+        let content: Vec<String> = rows
+            .borrow()
+            .iter()
+            .map(|row| plain_row(row))
+            .map(|row| row.trim_end_matches('\n').to_string())
+            .filter(|row| {
+                (row.starts_with('\u{2502}') && row.ends_with('\u{2502}'))
+                    || (row.starts_with("\u{256d}\u{2500}") && row.ends_with('\u{256e}'))
+                    || (row.starts_with("\u{2570}\u{2500}") && row.ends_with('\u{256f}'))
+            })
+            .collect();
+        assert_eq!(
+            content.len(),
+            rows.borrow().len(),
+            "title, content, and footer rows are all framed: {:?}",
+            rows.borrow()
+        );
+        assert!(
+            content.len() >= 4,
+            "the paragraph wraps: {:?}",
+            rows.borrow()
+        );
+        assert!(
+            content[2].starts_with("\u{2502} movements"),
+            "the wrapped row drops the leading whitespace: {:?}",
+            content[2]
+        );
+        for row in &content {
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(row.as_str()),
+                96 + 4,
+                "misaligned row: {row:?}"
+            );
+        }
     }
 
     #[test]
