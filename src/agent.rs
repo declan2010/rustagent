@@ -342,6 +342,34 @@ fn compaction_budget(context_window: u64) -> (u64, u64) {
     (reserve, keep_recent)
 }
 
+/// Resolves the effective context window against what the model declares:
+/// the declared maximum clamps the configured window down (a model that only
+/// supports 32k never receives a 65k `num_ctx`), and a bigger declaration
+/// leaves the configured cap in place as a hardware budget. Returns a muted
+/// notice whenever the declaration differs from the configured value.
+fn resolve_context_window(base: u64, declared: Option<u64>) -> (u64, Option<String>) {
+    let Some(declared) = declared.filter(|value| *value > 0) else {
+        return (base, None);
+    };
+    if declared < base {
+        let note = format!(
+            "· context window: {} tokens (model limit; configured {})",
+            ui::format_number(declared),
+            ui::format_number(base)
+        );
+        return (declared, Some(note));
+    }
+    if declared > base {
+        let note = format!(
+            "· context window: {} tokens (model supports {}; capped by OPENAI_CONTEXT_WINDOW)",
+            ui::format_number(base),
+            ui::format_number(declared)
+        );
+        return (base, Some(note));
+    }
+    (base, None)
+}
+
 /// Finds where to cut earlier conversation so the recent `keep_recent_tokens` stay
 /// intact, matching MinAgent's `findCompactionCutPoint`. Returns an index into
 /// `conversation` (the messages after the system prompt), or 0 if no cut fits.
@@ -629,6 +657,27 @@ impl Agent {
     /// session DELETE). Called once after the main loop ends.
     pub async fn close_mcp(&mut self) {
         self.mcp.close().await;
+    }
+
+    /// Clamps the effective context window to what the model declares via
+    /// Ollama's `/api/show` (already cached by the think snapshot), updating
+    /// `num_ctx`, the meter, and the compaction budget. Returns a muted
+    /// notice when the declaration differs from the configured window.
+    pub async fn apply_effective_context_window(&mut self) -> Option<String> {
+        let declared = if self.is_local_endpoint() {
+            self.client
+                .think_info_for(&self.client.model)
+                .await
+                .and_then(|info| info.context_length)
+        } else {
+            None
+        };
+        let (effective, notice) = resolve_context_window(self.config.context_window, declared);
+        if effective != self.config.context_window {
+            self.config.context_window = effective;
+            self.client.context_window = effective;
+        }
+        notice
     }
 
     pub fn reset(&mut self) {
@@ -1596,5 +1645,35 @@ mod tests {
         // Inactive connections inject nothing.
         let inactive = build_system_prompt(&config, Mode::Build, "", false, "");
         assert!(!inactive.contains("MCP:"));
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::*;
+
+    #[test]
+    fn declared_window_clamps_both_directions_with_notices() {
+        // A model that supports less shrinks the window with a model-limit note.
+        let (effective, notice) = resolve_context_window(65_536, Some(32_768));
+        assert_eq!(effective, 32_768);
+        assert!(
+            notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("model limit")
+        );
+
+        // A model that supports more keeps the configured cap, with a note.
+        let (effective, notice) = resolve_context_window(65_536, Some(262_144));
+        assert_eq!(effective, 65_536);
+        let note = notice.expect("capped notice");
+        assert!(note.contains("capped by OPENAI_CONTEXT_WINDOW"));
+        assert!(note.contains("262,144"));
+
+        // Matching declarations and unknown declarations stay silent.
+        assert_eq!(resolve_context_window(65_536, Some(65_536)), (65_536, None));
+        assert_eq!(resolve_context_window(65_536, None), (65_536, None));
+        assert_eq!(resolve_context_window(65_536, Some(0)), (65_536, None));
     }
 }

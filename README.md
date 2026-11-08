@@ -87,7 +87,7 @@ Notes:
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
 | `OPENAI_API_KEY` | unset | Bearer token |
 | `OPENAI_MODEL` | required | Model identifier |
-| `OPENAI_CONTEXT_WINDOW` | `262144` | Context window used by the status line |
+| `OPENAI_CONTEXT_WINDOW` | `262144` | Context window cap; local Ollama models also clamp to their declared maximum |
 | `OPENAI_TIMEOUT_MS` | `0` | Request timeout; `0` disables it |
 | `OPENAI_OLLAMA_THINK` | unset | Enables native `/api/chat` with a think level |
 | `OPENAI_INPUT` | `text,image` | Input modalities |
@@ -99,6 +99,99 @@ On the native Ollama path (`OPENAI_OLLAMA_THINK` set), RustAgent sends
 `options.num_ctx = OPENAI_CONTEXT_WINDOW` so long conversations are not truncated
 to Ollama's small default context. Raising the window increases VRAM use; on an
 unstable GPU a smaller window may be safer.
+
+The configured window is a **cap**: for local Ollama models the model's declared
+maximum (from `/api/show` metadata, fetched with the same cached snapshot as
+the think states) clamps it in both directions — a model that only supports
+32k never receives a 65k `num_ctx`, and a model that declares 262k keeps the
+configured cap as a hardware budget. The banner, the token meter, and the
+auto-compaction budget all follow the effective window, and a muted notice
+explains the clamp at startup and after `/model` switches. Endpoints without
+the snapshot (cloud, non-Ollama) keep the configured value unchanged.
+
+### Commands
+
+- `/new` — start a new conversation
+- `/model` — list models; `/model <number|name>` switches
+- `/compact` — summarize earlier history and keep the checkpoint
+- `/help` — command list
+- `/exit` — quit
+
+## What is implemented
+
+- OpenAI-compatible SSE streaming: content, reasoning deltas, tool-call assembly, usage,
+  `[DONE]`, `STREAM_ERROR`/`STREAM_ENDED`/`INVALID_TOOL_CALL` checks.
+- Ollama native NDJSON streaming via `OPENAI_OLLAMA_THINK`: `message.thinking`,
+  `message.tool_calls`, `done`/`eval_count`, and the repeated-call replacement rules.
+- Tool-call id unification across rounds (`unique_tool_call_ids`), so cloud upstreams
+  cannot attribute a tool result to the wrong round.
+- Tool loop with schema validation, "Did you mean" suggestions, tool-result metadata,
+  a 16-calls-per-round limit, and a 32-round safety stop.
+- Workspace tools: `read_file`, `list_directory`, `edit_file`, `write_file`,
+  `delete_file`, `delete_directory`, `search_files`, `run_terminal`.
+- Path sandboxing: writes/edits/deletes/listings/search stay inside the workspace;
+  `read_file` accepts an absolute path outside it (explicit user-named reads).
+- `run_terminal` permission modes: `auto`, `ask` (y/N prompt), `off` (tool hidden),
+  with a 120 s timeout and a 64 KiB output cap.
+- Token estimate (UTF-8 bytes ÷ 3) and the per-reading `t/s` meter: the window starts at
+  the first streamed delta (excluding prefill) and ends at completion; live values use
+  the byte estimate, the final value uses exact `usage.completion_tokens`.
+- Manual `/compact` using the MinAgent summary checkpoint format.
+- Auto-compaction before the context limit: before each model request, if usage
+  crosses `context_window - reserve` (reserve = `min(16384, window/4)`), earlier
+  history is summarized with the same checkpoint format and the recent
+  `keep_recent` tokens (`min(20000, window/4)`) are kept verbatim. Mirrors
+  MinAgent's `compactAutomaticallyIfNeeded` and `findCompactionCutPoint`.
+- Build/Plan modes like MinAgent: **Tab** at the prompt toggles between Build
+  (all tools) and Plan (read-only: `read_file`, `list_directory`, `search_files`).
+  Plan mode advertises only those tools and rejects write/command tool calls with
+  `Tool 'X' is unavailable in Plan mode. Switch to Build.`; the system prompt and
+  prompt label (`Plan ›` orange / `Build ›` green) switch accordingly, context usage
+  is reset, and the footer shows a `Running: Plan/Build` segment when a turn runs in
+  a different mode than the selected one.
+- `/model` works like MinAgent's: it fetches the API catalog (`GET /models`), and with
+  no argument opens an **interactive selector** in the footer — a titled list
+  (`┌─ MODELS · N matches`) with a `›` highlight, **↑/↓** to move, **Enter** to
+  switch, **Esc** to cancel (mirroring MinAgent's `formatAutocompletePanel`).
+  `/model <number|name|prefix>` switches directly. Selection applies the
+  catalog entry's context window and input modalities when the API supplies them
+  (falling back to the configured defaults), resets context usage, prints fallback
+  notices, and **persists `OPENAI_MODEL=<id>` to `~/.config/rustagent/.env` so
+  the chosen model becomes the default for future sessions. Prefix matching
+  mirrors MinAgent: exact id, else a case-insensitive prefix (`qwen3` → ambiguous
+  list), else error. Non-interactive runs fall back to the printed numbered list.
+  On a **local Ollama endpoint with an empty catalog**, `/model` pulls a small
+  default model (`qwen3:0.6b`) through `POST /api/pull` — sparse progress lines
+  (event kinds + every 10% step) — and re-opens the selector with the refreshed
+  catalog.
+- Persistent bottom footer (ported from MinAgent's scroll-region renderer): truecolor
+  status row with model, think level, token usage and a 10-cell meter, activity,
+  cumulative `proc` time, and live/final `t/s`; a hints row ending with the workspace
+  root path. It clears the screen on start, pins the transcript to a scrolling region,
+  redraws every ~100 ms while streaming and every second during silent tools, falls
+  back to a plain status line when the output is not a TTY, and resets the region on
+  exit.
+- GFM table rendering (ported from MinAgent's `markdown-terminal.mjs`): when the model
+  emits a Markdown table (`|` header, separator, body rows), it is buffered and
+  rendered with aligned columns, `│` cell borders, a `─┼─` separator, and a bold
+  cyan header row. Inline Markdown inside cells is stripped. Non-table text still
+  streams raw.
+- Ctrl+T at the prompt cycles the think states the selected model actually declares.
+  The model's Ollama `/api/show` snapshot (cached per model) reports the `thinking`
+  capability and the effort levels its chat template declares (`reasoning_effort`,
+  e.g. qwen3.8: `xhigh → medium → low`). Models that cannot think keep thinking off
+  and Ctrl+T says so; models with a plain template cycle `off ↔ on`; models with
+  unknown snapshots use the generic MinAgent cycle (`off → low → medium → high`).
+  The level applies to the next request. Only active for local Ollama endpoints;
+  cooked REPL otherwise. The `/model` selector marks models without the thinking
+  capability as `(no think)`, and switching models prints which levels are valid.
+  Because current Ollama builds may not map think levels for native GGUF models
+  (the template default applies instead), a one-line warning is printed the first
+  time such a level is selected.
+- Esc interrupts the current turn: it cancels the in-flight model stream (or the
+  running terminal command, which is killed via `kill_on_drop`), prints
+  "Response stopped. You can send a new message.", and returns to `Ready`. Typed-ahead
+  keys pressed during a turn are preserved for the next prompt.
 
 ## Chat bubbles
 

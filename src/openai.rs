@@ -325,13 +325,14 @@ impl<'a> StreamParser<'a> {
                 // Accumulate action JSON until the closing tag. Hold back a
                 // tail that might be the start of <|END_ACTION|>.
                 if let Some(pos) = self.content_buffer.find(Self::END_ACTION) {
-                    self.action_buf
-                        .push_str(&self.content_buffer[..pos]);
-                    self.content_buffer = self.content_buffer[pos + Self::END_ACTION.len()..].to_string();
+                    self.action_buf.push_str(&self.content_buffer[..pos]);
+                    self.content_buffer =
+                        self.content_buffer[pos + Self::END_ACTION.len()..].to_string();
                     self.in_action = false;
                     self.finalize_action();
                 } else {
-                    let safe = self.content_buffer
+                    let safe = self
+                        .content_buffer
                         .len()
                         .saturating_sub(Self::END_ACTION.len() - 1);
                     let safe = self.safe_cut(&self.content_buffer, safe);
@@ -352,7 +353,8 @@ impl<'a> StreamParser<'a> {
                         self.content_buffer[pos + Self::END_THINKING.len()..].to_string();
                     self.in_thinking = false;
                 } else {
-                    let safe = self.content_buffer
+                    let safe = self
+                        .content_buffer
                         .len()
                         .saturating_sub(Self::END_THINKING.len() - 1);
                     let safe = self.safe_cut(&self.content_buffer, safe);
@@ -378,8 +380,7 @@ impl<'a> StreamParser<'a> {
                         self.content.push_str(head);
                         (self.on_text)(head);
                     }
-                    self.content_buffer =
-                        self.content_buffer[pos + marker.len()..].to_string();
+                    self.content_buffer = self.content_buffer[pos + marker.len()..].to_string();
                     match marker {
                         Self::START_THINKING => self.in_thinking = true,
                         Self::START_ACTION => {
@@ -400,9 +401,14 @@ impl<'a> StreamParser<'a> {
                     let mut hold = self.content_buffer.len();
                     for (pos, _) in self.content_buffer.match_indices("<|") {
                         let tail = &self.content_buffer[pos..];
-                        let forming = [Self::START_THINKING, Self::END_THINKING, Self::START_ACTION, Self::END_ACTION]
-                            .iter()
-                            .any(|marker| marker.starts_with(tail) && tail.len() < marker.len());
+                        let forming = [
+                            Self::START_THINKING,
+                            Self::END_THINKING,
+                            Self::START_ACTION,
+                            Self::END_ACTION,
+                        ]
+                        .iter()
+                        .any(|marker| marker.starts_with(tail) && tail.len() < marker.len());
                         if forming {
                             hold = pos;
                             break;
@@ -979,7 +985,10 @@ impl Client {
             body["options"] = json!({ "num_ctx": self.context_window });
         }
 
-        let target = native_target.as_deref().unwrap_or(&self.endpoint).to_string();
+        let target = native_target
+            .as_deref()
+            .unwrap_or(&self.endpoint)
+            .to_string();
         let native = native_target.is_some();
 
         // Shared delta counter so all three callbacks can increment it without
@@ -1000,7 +1009,14 @@ impl Client {
                 on_tool_call(name);
             };
             match self
-                .stream_once(&target, native, &body, &mut on_text_w, &mut on_reasoning_w, &mut on_tool_call_w)
+                .stream_once(
+                    &target,
+                    native,
+                    &body,
+                    &mut on_text_w,
+                    &mut on_reasoning_w,
+                    &mut on_tool_call_w,
+                )
                 .await
             {
                 Ok(completion) => return Ok(completion),
@@ -1010,7 +1026,10 @@ impl Client {
                     // a model that cannot think. Retry immediately without it
                     // and remember the model: this fires at most once because
                     // the `think` field is gone on the next pass.
-                    if native && message.contains("does not support thinking") && body.get("think").is_some() {
+                    if native
+                        && message.contains("does not support thinking")
+                        && body.get("think").is_some()
+                    {
                         if let Some(object) = body.as_object_mut() {
                             object.remove("think");
                         }
@@ -1082,10 +1101,18 @@ impl Client {
         let use_ndjson = native && !content_type.contains("text/event-stream");
         if !use_ndjson && !content_type.contains("text/event-stream") {
             let body_text = read_prefix(response, 2 * 1024).await;
-            let expected = if native { "streaming NDJSON" } else { "streaming" };
+            let expected = if native {
+                "streaming NDJSON"
+            } else {
+                "streaming"
+            };
             bail!(
                 "[ENDPOINT_SHAPE] The endpoint did not return a {expected} response (Content-Type: {}). Response: {body_text}",
-                if content_type.is_empty() { "unknown" } else { &content_type }
+                if content_type.is_empty() {
+                    "unknown"
+                } else {
+                    &content_type
+                }
             );
         }
 
@@ -1242,9 +1269,13 @@ impl Client {
         }
         let payload = match self.show_request(&format!("{base}/api/show"), model).await {
             Some(payload) => Some(payload),
-            None => self
-                .show_request(&format!("{base}/api/show?model={}", urlencode(model)), model)
-                .await,
+            None => {
+                self.show_request(
+                    &format!("{base}/api/show?model={}", urlencode(model)),
+                    model,
+                )
+                .await
+            }
         };
         let Some(payload) = payload else {
             if let Ok(mut failed) = self.show_failed.lock() {
@@ -1279,11 +1310,26 @@ impl Client {
                     .and_then(|(_, value)| value.as_str())
                     .map(str::to_string)
             });
+        // The declared context length is an architecture-prefixed metadata
+        // key (qwen35.context_length, llama.context_length, ...).
+        let context_length = payload
+            .get("model_info")
+            .and_then(Value::as_object)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(key, _)| {
+                        let key = key.as_str();
+                        key == "context_length" || key.ends_with(".context_length")
+                    })
+                    .and_then(|(_, value)| value.as_u64())
+            });
         let info = ThinkInfo {
             has_thinking,
             levels,
             default_level,
             gguf_arch,
+            context_length,
         };
         if let Ok(mut cache) = self.think_cache.lock() {
             cache.insert(model.to_string(), info.clone());
@@ -1464,6 +1510,9 @@ pub struct ThinkInfo {
     pub levels: Vec<String>,
     pub default_level: Option<String>,
     pub gguf_arch: Option<String>,
+    /// The model's declared maximum context (GGUF metadata, e.g.
+    /// `qwen35.context_length`), when the snapshot exposes it.
+    pub context_length: Option<u64>,
 }
 
 impl ThinkInfo {
@@ -1568,13 +1617,11 @@ mod tests {
         let stream_err = anyhow::anyhow!("[STREAM_ERROR] Endpoint streaming error: boom");
         assert!(is_recoverable_endpoint_error(&stream_err, 0));
         assert!(!is_recoverable_endpoint_error(&stream_err, 1));
-        let shape = anyhow::anyhow!(
-            "[ENDPOINT_SHAPE] The endpoint did not return a streaming response."
-        );
+        let shape =
+            anyhow::anyhow!("[ENDPOINT_SHAPE] The endpoint did not return a streaming response.");
         assert!(is_recoverable_endpoint_error(&shape, 12));
-        let connect = anyhow::anyhow!(
-            "Could not connect to the OpenAI-compatible endpoint: timed out"
-        );
+        let connect =
+            anyhow::anyhow!("Could not connect to the OpenAI-compatible endpoint: timed out");
         assert!(is_recoverable_endpoint_error(&connect, 0));
         let rate_limited = anyhow::anyhow!("Endpoint returned HTTP 429: too many requests");
         assert!(is_recoverable_endpoint_error(&rate_limited, 0));
@@ -1582,9 +1629,8 @@ mod tests {
         assert!(is_recoverable_endpoint_error(&server_error, 0));
         let bad_request = anyhow::anyhow!("Endpoint returned HTTP 400: bad request");
         assert!(!is_recoverable_endpoint_error(&bad_request, 0));
-        let invalid_tool = anyhow::anyhow!(
-            "[INVALID_TOOL_CALL] Endpoint returned an incomplete tool call."
-        );
+        let invalid_tool =
+            anyhow::anyhow!("[INVALID_TOOL_CALL] Endpoint returned an incomplete tool call.");
         assert!(!is_recoverable_endpoint_error(&invalid_tool, 0));
     }
 
@@ -1898,10 +1944,8 @@ mod tests {
         let server = tokio::spawn(async move {
             const THINK_REJECT: &str =
                 "{\"error\":\"\\\"ministral-3:14b\\\" does not support thinking\"}";
-            const BODY: &str =
-                "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":3,\"prompt_eval_count\":2}\n";
-            const SECOND: &str =
-                "{\"message\":{\"content\":\"second\"}}\n{\"done\":true,\"eval_count\":3,\"prompt_eval_count\":2}\n";
+            const BODY: &str = "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":3,\"prompt_eval_count\":2}\n";
+            const SECOND: &str = "{\"message\":{\"content\":\"second\"}}\n{\"done\":true,\"eval_count\":3,\"prompt_eval_count\":2}\n";
             // complete() now probes /api/show before the first chat request;
             // answer those with 404 so the capabilities stay unknown and the
             // 400-based recovery flow below runs unchanged. Chat requests:
@@ -1984,7 +2028,10 @@ mod tests {
 
         let bodies_view = bodies.lock().await;
         assert_eq!(bodies_view.len(), 2, "exactly one retry without thinking");
-        assert!(bodies_view[0].contains("\"think\""), "first attempt sends think");
+        assert!(
+            bodies_view[0].contains("\"think\""),
+            "first attempt sends think"
+        );
         assert!(
             !bodies_view[1].contains("\"think\""),
             "retry must not send think; body: {}",
@@ -2012,8 +2059,15 @@ mod tests {
         server.await.expect("server task");
         assert_eq!(again, "second");
         let bodies_view = bodies.lock().await;
-        assert_eq!(bodies_view.len(), 3, "three requests total, no extra retries");
-        assert!(!bodies_view[2].contains("\"think\""), "memo keeps think off");
+        assert_eq!(
+            bodies_view.len(),
+            3,
+            "three requests total, no extra retries"
+        );
+        assert!(
+            !bodies_view[2].contains("\"think\""),
+            "memo keeps think off"
+        );
     }
 
     #[test]
@@ -2040,13 +2094,10 @@ mod tests {
     fn think_info_cycle_respects_declared_levels() {
         let declared = ThinkInfo {
             has_thinking: true,
-            levels: vec![
-                "xhigh".to_string(),
-                "medium".to_string(),
-                "low".to_string(),
-            ],
+            levels: vec!["xhigh".to_string(), "medium".to_string(), "low".to_string()],
             default_level: Some("xhigh".to_string()),
             gguf_arch: Some("qwen35".to_string()),
+            context_length: None,
         };
         assert_eq!(
             declared.cycle(),
@@ -2062,6 +2113,7 @@ mod tests {
             levels: Vec::new(),
             default_level: None,
             gguf_arch: None,
+            context_length: None,
         };
         assert_eq!(plain.cycle(), &["false".to_string(), "true".to_string()]);
         let mute = ThinkInfo {
@@ -2069,6 +2121,7 @@ mod tests {
             levels: Vec::new(),
             default_level: None,
             gguf_arch: None,
+            context_length: None,
         };
         assert_eq!(mute.cycle(), &["false".to_string()]);
         // Ctrl+T follows the declared cycle and wraps back to off.
@@ -2111,10 +2164,8 @@ mod tests {
         let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let server_bodies = Arc::clone(&bodies);
         let server = tokio::spawn(async move {
-            const SHOW: &str =
-                "{\"capabilities\":[\"completion\"],\"template\":\"\"}";
-            const CHAT: &str =
-                "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":1,\"prompt_eval_count\":1}\n";
+            const SHOW: &str = "{\"capabilities\":[\"completion\"],\"template\":\"\"}";
+            const CHAT: &str = "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":1,\"prompt_eval_count\":1}\n";
             let mut chats = 0u32;
             loop {
                 let (mut socket, _) = listener.accept().await.expect("accept");
@@ -2128,10 +2179,13 @@ mod tests {
                         SHOW
                     )
                 } else {
-                    server_bodies
-                        .lock()
-                        .await
-                        .push(request.split("\r\n\r\n").nth(1).unwrap_or_default().to_string());
+                    server_bodies.lock().await.push(
+                        request
+                            .split("\r\n\r\n")
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
                     chats += 1;
                     format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n{}",
@@ -2413,5 +2467,65 @@ mod tests {
             error.to_string().contains("pull model manifest not found"),
             "error carries the stream message: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod context_show_tests {
+    use super::*;
+    use crate::config::PermissionMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// /api/show metadata carries the declared context length under an
+    /// architecture-prefixed key; the snapshot exposes it alongside thinking.
+    #[tokio::test]
+    async fn show_snapshot_exposes_the_declared_context_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let bodies: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let server_bodies = Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            const SHOW: &str = "{\"capabilities\":[\"thinking\",\"tools\"],\
+                \"model_info\":{\"qwen35.context_length\":262144,\"qwen35.architecture\":\"qwen35\"},\
+                \"template\":\"\"}";
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = vec![0u8; 16 * 1024];
+            let count = socket.read(&mut buffer).await.expect("read");
+            server_bodies
+                .lock()
+                .expect("bodies")
+                .push(String::from_utf8_lossy(&buffer[..count]).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                SHOW.len(),
+                SHOW
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "qwen3.5:9b".to_string(),
+            context_window: 8192,
+            timeout_ms: 5_000,
+            ollama_think: None,
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        let info = client.think_info_for("qwen3.5:9b").await.expect("snapshot");
+        server.await.expect("server task");
+        assert!(info.has_thinking);
+        assert_eq!(info.gguf_arch.as_deref(), Some("qwen35"));
+        assert_eq!(info.context_length, Some(262_144));
     }
 }
