@@ -212,15 +212,28 @@ pub fn format_elapsed(duration: Duration) -> String {
     format!("{}h{:02}m", minutes / 60, minutes % 60)
 }
 
+/// Banner rows for one content line, wrapped to the frame like MinAgent's
+/// `panelLine`: `│ {line}{padding} │` measures inner + 4, same as the edges.
+fn panel_rows(content: &str, color: (u8, u8, u8), inner: usize) -> Vec<String> {
+    wrap_message(content, inner)
+        .into_iter()
+        .map(|line| {
+            let padding = " ".repeat(inner.saturating_sub(UnicodeWidthStr::width(line.as_str())));
+            format!(
+                "{} {}{} {}",
+                cyan("│"),
+                styled(&line, color, false),
+                padding,
+                cyan("│")
+            )
+        })
+        .collect()
+}
+
 fn panel_line(content: &str, color: (u8, u8, u8), inner: usize) {
-    let padding = " ".repeat(inner.saturating_sub(UnicodeWidthStr::width(content)));
-    println!(
-        "{} {} {} {}",
-        cyan("│"),
-        styled(content, color, false),
-        padding,
-        cyan("│")
-    );
+    for row in panel_rows(content, color, inner) {
+        println!("{row}");
+    }
 }
 
 /// Startup panel, mirroring MinAgent's model/context/input/terminal/workspace rows.
@@ -732,6 +745,54 @@ pub fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strips ANSI styling so emitted rows can be measured by column.
+    fn plain_text(row: &str) -> String {
+        let mut out = String::new();
+        let mut chars = row.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(character);
+        }
+        out
+    }
+
+    #[test]
+    fn banner_rows_align_with_the_edges() {
+        // The banner's panel rows measure inner + 4 like the edges; long
+        // content wraps inside the frame instead of pushing the border out.
+        for content in [
+            "RustAgent · SESSION",
+            "Context    ~1,246 / 65,536 tokens  1.9%  \u{2570}\u{2571}\u{2571}",
+            "Workspace  a-very-long-workspace-name-that-exceeds-the-frame-and-must-wrap-inside",
+        ] {
+            for row in panel_rows(content, MAGENTA, 51) {
+                let plain = plain_text(&row);
+                assert_eq!(
+                    unicode_width::UnicodeWidthStr::width(plain.as_str()),
+                    51 + 4,
+                    "misaligned banner row: {plain:?}"
+                );
+            }
+        }
+        let wrapped = panel_rows(
+            "Workspace  a-very-long-workspace-name-that-exceeds-the-frame",
+            PALE,
+            51,
+        );
+        assert!(
+            wrapped.len() >= 2,
+            "long banner content wraps inside the frame: {wrapped:?}"
+        );
+    }
 
     #[test]
     fn numbers_use_thousands_separators() {
