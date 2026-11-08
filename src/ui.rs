@@ -482,7 +482,21 @@ impl AssistantBubble {
                 self.finish_line();
                 continue;
             }
-            if character.is_whitespace() {
+            if character == '\t' {
+                // A tab renders as a jump to the next 8-column stop, not a
+                // zero-width cell; widen it up front so the row's width math
+                // measures what actually lands on screen.
+                self.flush_word();
+                let pending = self
+                    .pending_whitespace
+                    .chars()
+                    .map(character_width)
+                    .sum::<usize>();
+                let spaces = tab_stop_spaces(2 + self.line_width + pending);
+                for _ in 0..spaces {
+                    self.pending_whitespace.push(' ');
+                }
+            } else if character.is_whitespace() {
                 self.flush_word();
                 self.pending_whitespace.push(character);
             } else {
@@ -580,6 +594,13 @@ impl AssistantBubble {
                 self.finish_line();
                 self.pending_whitespace.clear();
                 carried_whitespace = 0;
+            }
+            // Mark the line started before the whitespace lands: the first
+            // word cluster would otherwise clear what a leading widened tab
+            // already wrote while its width stays counted.
+            if !self.line_started {
+                self.line_started = true;
+                self.line_content.clear();
             }
             self.line_content.push_str(&self.pending_whitespace);
             self.line_width += carried_whitespace;
@@ -723,13 +744,44 @@ fn character_width(character: char) -> usize {
     unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
 }
 
+/// The spaces a tab occupies at this on-screen column: terminals advance the
+/// cursor to the next 8-column stop, never to a zero-width cell.
+fn tab_stop_spaces(column: usize) -> usize {
+    8 - (column % 8)
+}
+
+/// Widens tabs into the spaces the terminal would actually render, counting
+/// columns from `offset` (a frame's content edge sits two columns in, after
+/// `│ `). Zero-width tabs used to under-measure rows, so the frame packed
+/// more text than fit and the terminal wrapped the overflowed rows.
+fn expand_tabs(value: &str, offset: usize) -> String {
+    if !value.contains('\t') {
+        return value.to_string();
+    }
+    let mut expanded = String::with_capacity(value.len());
+    let mut column = offset;
+    for character in value.chars() {
+        if character == '\t' {
+            let spaces = tab_stop_spaces(column);
+            for _ in 0..spaces {
+                expanded.push(' ');
+            }
+            column += spaces;
+        } else {
+            column += character_width(character);
+            expanded.push(character);
+        }
+    }
+    expanded
+}
+
 /// Word-wraps text like MinAgent's `wrapTextLine`: break at the last space
 /// within the width when possible, hard-break words that do not fit, and trim
 /// each line's trailing whitespace.
 pub fn wrap_message(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for line in text.split('\n') {
-        wrap_line(line, width, &mut lines);
+        wrap_line(&expand_tabs(line, 2), width, &mut lines);
     }
     if lines.is_empty() {
         lines.push(String::new());
@@ -1131,6 +1183,81 @@ mod assistant_bubble_tests {
                 "misaligned row: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn assistant_bubble_expands_tabs_to_terminal_stops() {
+        // Models tab-indent bullets (`*\t**word**`); a zero-width tab used to
+        // under-measure the row, the frame packed more text than fit, and the
+        // terminal wrapped the border onto the next line.
+        let text = "*\t**Capacitor:** La presencia de carpetas `android`, `ios`, \
+             `android-native` y el archivo `capacitor.config.ts` indica que es una \
+             aplicaci\u{f3}n h\u{ed}brida.\n\t*second* bullet starts with its own tab\n";
+        for streamed in [false, true] {
+            let rows: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+            let sink_rows = Rc::clone(&rows);
+            let mut bubble = AssistantBubble::with_emit_style(
+                "Thinking \u{b7} test".to_string(),
+                Box::new(move |fragment| {
+                    sink_rows.borrow_mut().push(fragment.to_string());
+                }),
+                96,
+                BubbleStyle::thinking(),
+            );
+            if streamed {
+                for character in text.chars() {
+                    bubble.write(&character.to_string());
+                }
+            } else {
+                bubble.write(&text);
+            }
+            bubble.close("complete");
+            let framed: Vec<String> = rows
+                .borrow()
+                .iter()
+                .map(|row| plain_row(row))
+                .map(|row| row.trim_end_matches('\n').to_string())
+                .filter(|row| row.starts_with('\u{2502}') && row.ends_with('\u{2502}'))
+                .collect();
+            assert!(framed.len() >= 3, "the bullets wrap: {:?}", rows.borrow());
+            for row in &framed {
+                assert!(!row.contains('\t'), "tabs are widened: {row:?}");
+                assert_eq!(
+                    unicode_width::UnicodeWidthStr::width(row.as_str()),
+                    96 + 4,
+                    "misaligned row: {row:?}"
+                );
+            }
+            // `*` sits at content column 0 (screen column 2), so the tab jumps
+            // to screen column 8: five spaces.
+            assert!(
+                framed[0].starts_with("\u{2502} *     **Capacitor:**"),
+                "the tab widens to the 8-column stop: {:?}",
+                framed[0]
+            );
+            // A leading tab of its own: six spaces from the content edge.
+            assert!(
+                framed
+                    .iter()
+                    .any(|row| row.starts_with("\u{2502}       *second*")),
+                "a leading tab widens to six spaces: {:?}",
+                framed
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_message_expands_tabs_to_terminal_stops() {
+        assert_eq!(
+            wrap_message("\tx\na\tb", 10),
+            vec!["      x".to_string(), "a     b".to_string()]
+        );
+        // Consecutive tabs walk stop by stop: from column 2 to 8 is six
+        // spaces, from 8 to 16 is eight more.
+        assert_eq!(
+            wrap_message("\t\tend", 30),
+            vec![format!("{}end", " ".repeat(6 + 8))]
+        );
     }
 
     #[test]
