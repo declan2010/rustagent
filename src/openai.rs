@@ -1293,6 +1293,26 @@ impl Client {
                     .any(|capability| capability == "thinking")
             })
             .unwrap_or(false);
+        let vision = payload
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|capabilities| {
+                capabilities
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|capability| capability == "vision")
+            })
+            .unwrap_or(false);
+        let audio = payload
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|capabilities| {
+                capabilities
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|capability| capability == "audio")
+            })
+            .unwrap_or(false);
         let template = payload
             .get("template")
             .and_then(Value::as_str)
@@ -1326,6 +1346,8 @@ impl Client {
             });
         let info = ThinkInfo {
             has_thinking,
+            vision,
+            audio,
             levels,
             default_level,
             gguf_arch,
@@ -1507,6 +1529,12 @@ pub struct ModelEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThinkInfo {
     pub has_thinking: bool,
+    /// Whether the model declares the `vision` capability (it accepts
+    /// images besides text).
+    pub vision: bool,
+    /// Whether the model declares the `audio` capability (it accepts audio
+    /// input besides text).
+    pub audio: bool,
     pub levels: Vec<String>,
     pub default_level: Option<String>,
     pub gguf_arch: Option<String>,
@@ -2094,6 +2122,8 @@ mod tests {
     fn think_info_cycle_respects_declared_levels() {
         let declared = ThinkInfo {
             has_thinking: true,
+            vision: false,
+            audio: false,
             levels: vec!["xhigh".to_string(), "medium".to_string(), "low".to_string()],
             default_level: Some("xhigh".to_string()),
             gguf_arch: Some("qwen35".to_string()),
@@ -2110,6 +2140,8 @@ mod tests {
         );
         let plain = ThinkInfo {
             has_thinking: true,
+            vision: false,
+            audio: false,
             levels: Vec::new(),
             default_level: None,
             gguf_arch: None,
@@ -2118,6 +2150,8 @@ mod tests {
         assert_eq!(plain.cycle(), &["false".to_string(), "true".to_string()]);
         let mute = ThinkInfo {
             has_thinking: false,
+            vision: false,
+            audio: false,
             levels: Vec::new(),
             default_level: None,
             gguf_arch: None,
@@ -2489,7 +2523,7 @@ mod context_show_tests {
         let bodies: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let server_bodies = Arc::clone(&bodies);
         let server = tokio::spawn(async move {
-            const SHOW: &str = "{\"capabilities\":[\"thinking\",\"tools\"],\
+            const SHOW: &str = "{\"capabilities\":[\"thinking\",\"vision\",\"audio\",\"tools\"],\
                 \"model_info\":{\"qwen35.context_length\":262144,\"qwen35.architecture\":\"qwen35\"},\
                 \"template\":\"\"}";
             let (mut socket, _) = listener.accept().await.expect("accept");
@@ -2525,6 +2559,8 @@ mod context_show_tests {
         let info = client.think_info_for("qwen3.5:9b").await.expect("snapshot");
         server.await.expect("server task");
         assert!(info.has_thinking);
+        assert!(info.vision);
+        assert!(info.audio);
         assert_eq!(info.gguf_arch.as_deref(), Some("qwen35"));
         assert_eq!(info.context_length, Some(262_144));
     }

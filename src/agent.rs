@@ -670,6 +670,45 @@ impl Agent {
     /// Ollama's `/api/show` (already cached by the think snapshot), updating
     /// `num_ctx`, the meter, and the compaction budget. Returns a muted
     /// notice when the declaration differs from the configured window.
+    /// Applies the model's declared input modalities for local Ollama, where
+    /// the catalog carries none but the `/api/show` capabilities do: `vision`
+    /// adds image input and `audio` adds audio input on top of text. Cloud
+    /// endpoints keep the catalog-applied modalities (`switch_model` already
+    /// applies `input_modalities` when the endpoint supplies them). Returns a
+    /// notice describing what was detected, so the banner's Input row and the
+    /// switch output both reflect the model's real capabilities.
+    pub async fn apply_input_modalities(&mut self) -> Option<String> {
+        if !self.is_local_endpoint() {
+            return None;
+        }
+        let (vision, audio) = self
+            .client
+            .think_info_for(&self.client.model)
+            .await
+            .map(|info| (info.vision, info.audio))
+            .unwrap_or((false, false));
+        let mut modalities = vec!["text".to_string()];
+        let mut declared = Vec::new();
+        if vision {
+            modalities.push("image".to_string());
+            declared.push("vision");
+        }
+        if audio {
+            modalities.push("audio".to_string());
+            declared.push("audio");
+        }
+        self.config.input_modalities = modalities;
+        if declared.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "· input: {} (model declares {})",
+                self.config.input_modalities.join(" · "),
+                declared.join(", ")
+            ))
+        }
+    }
+
     pub async fn apply_effective_context_window(&mut self) -> Option<String> {
         let declared = if self.is_local_endpoint() {
             self.client

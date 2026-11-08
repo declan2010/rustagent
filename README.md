@@ -103,7 +103,7 @@ exists.
 | `OPENAI_CONTEXT_WINDOW` | `262144` | Context window cap; local Ollama models also clamp to their declared maximum |
 | `OPENAI_TIMEOUT_MS` | `0` | Request timeout; `0` disables it |
 | `OPENAI_OLLAMA_THINK` | unset | Enables native `/api/chat` with a think level |
-| `OPENAI_INPUT` | `text,image` | Input modalities |
+| `OPENAI_INPUT` | `text,image` | Input modalities; local Ollama models override them with their declared capabilities (`vision` → image, `audio` → audio) |
 | `TERMINAL_MODE` | `ask` | `auto`, `ask`, or `off`; `off` hides `run_terminal` |
 | `SKILLS_MODE` | `off` | `auto`, `ask`, or `off`; discovered `SKILL.md` catalogs enable the `load_skill` tool |
 | `MCP_MODE` | `off` | `auto`, `ask`, or `off`; connects the servers in `.rustagent/mcp.json` |

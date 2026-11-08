@@ -77,12 +77,14 @@ async fn run() -> Result<()> {
     let config = config::load()?;
     let mut agent = Agent::new(config).await?;
     // Warm the current model's /api/show snapshot up front so Ctrl+T, the
-    // request path, and the effective context window know its declared state
-    // immediately (local Ollama only).
+    // request path, the effective context window, and the input modalities
+    // know its declared state immediately (local Ollama only).
     let mut context_notice = None;
+    let mut input_notice = None;
     if agent.is_local_endpoint() {
         agent.client.think_info_for(&agent.config.model).await;
         context_notice = agent.apply_effective_context_window().await;
+        input_notice = agent.apply_input_modalities().await;
     }
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let footer = Footer::new();
@@ -106,6 +108,9 @@ async fn run() -> Result<()> {
         );
     }
     if let Some(notice) = context_notice {
+        println!("{}", ui::muted(&notice));
+    }
+    if let Some(notice) = input_notice {
         println!("{}", ui::muted(&notice));
     }
     agent.render_ready(&footer);
@@ -688,6 +693,11 @@ async fn apply_model_switch(agent: &mut Agent, footer: &Footer, entry: &ModelEnt
             }
             // Clamp the window to what the model actually declares.
             if let Some(note) = agent.apply_effective_context_window().await {
+                println!("{}", ui::muted(&note));
+            }
+            // The same /api/show snapshot tells whether the model sees
+            // images; the banner's Input row follows.
+            if let Some(note) = agent.apply_input_modalities().await {
                 println!("{}", ui::muted(&note));
             }
             match config::persist_model_default(&entry.id) {
