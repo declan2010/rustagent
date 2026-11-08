@@ -339,7 +339,19 @@ async fn handle_input(
 
 async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str>, stdin: &mut Input) {
     agent.set_activity(footer, "Loading models", agent.last_rate);
-    let catalog = agent.client.list_models().await;
+    let mut catalog = agent.client.list_models().await;
+    // An empty local catalog does not have to be a dead end: pull a small
+    // default model and retry the listing once.
+    if let Err(error) = &catalog {
+        if agent.is_local_endpoint()
+            && error.to_string().contains("no available model identifiers")
+        {
+            match pull_default_and_relist(agent, footer).await {
+                Ok(models) => catalog = Ok(models),
+                Err(pull_error) => ui::print_error(&pull_error.to_string()),
+            }
+        }
+    }
     match selection {
         None => match catalog {
             Ok(models) => {
@@ -392,6 +404,67 @@ async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str
             apply_model_switch(agent, footer, &entry).await;
         }
     }
+}
+
+/// The small default model pulled when a local Ollama endpoint has no models.
+const FALLBACK_PULL_MODEL: &str = "qwen3:0.6b";
+
+/// Pulls the small default model with visible progress and re-lists the
+/// catalog. Progress prints sparsely: new event kinds and every 10%% step.
+async fn pull_default_and_relist(
+    agent: &mut Agent,
+    footer: &Footer,
+) -> anyhow::Result<Vec<ModelEntry>> {
+    ui::print_info(&ui::muted(&format!(
+        "· The model catalog is empty; pulling {FALLBACK_PULL_MODEL} (light default)...",
+    )));
+    agent.set_activity(footer, "Pulling qwen3:0.6b", agent.last_rate);
+    let mut previous_key = String::new();
+    let mut previous_milestone: Option<usize> = None;
+    agent
+        .client
+        .pull_model(FALLBACK_PULL_MODEL, &mut |text| {
+            if let Some(progress) =
+                pull_progress_print(text, &mut previous_key, &mut previous_milestone)
+            {
+                println!(
+                    "{}",
+                    ui::muted(&format!("· pulling {FALLBACK_PULL_MODEL}: {progress}"))
+                );
+            }
+        })
+        .await?;
+    agent.client.list_models().await
+}
+
+/// Turns a `/api/pull` status event into the sparse progress lines users see:
+/// a line prints once per distinct event kind and again at every 10% step of
+/// the same kind. Returns the line or `None` to stay quiet.
+fn pull_progress_print(
+    text: &str,
+    previous_key: &mut String,
+    previous_milestone: &mut Option<usize>,
+) -> Option<String> {
+    // Split a trailing " 45%" into a percent so progress of the same event
+    // prints only at every 10% step; without one the key is the whole status.
+    let parsed = text.rfind('%').and_then(|at| {
+        let head = text[..at].trim_end();
+        let start = head.rfind(' ')? + 1;
+        let percent = head[start..].parse::<usize>().ok()?;
+        Some((head[..start].trim_end().to_string(), Some(percent)))
+    });
+    let (key, percent) = parsed.unwrap_or((text.to_string(), None));
+    let milestone = percent.map(|value| value / 10);
+    if *previous_key != key {
+        *previous_key = key;
+        *previous_milestone = milestone;
+        return Some(text.to_string());
+    }
+    if milestone.is_some() && milestone != *previous_milestone {
+        *previous_milestone = milestone;
+        return Some(text.to_string());
+    }
+    None
 }
 
 /// Terminal-cursor report timeout, matching MinAgent's `readTerminalCursor`.
@@ -607,5 +680,43 @@ async fn apply_model_switch(agent: &mut Agent, footer: &Footer, entry: &ModelEnt
             agent.render_ready(footer);
         }
         Err(error) => ui::print_error(&error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pull progress stays quiet: one line per event kind, then only at every
+    /// 10% step of the same kind.
+    #[test]
+    fn pull_progress_prints_are_sparse() {
+        let mut kind = String::new();
+        let mut milestone: Option<usize> = None;
+        let mut seen = Vec::new();
+        for text in [
+            "pulling manifest",
+            "pulling abc123 5%",
+            "pulling abc123 7%",
+            "pulling abc123 15%",
+            "pulling abc123 17%",
+            "pulling abc123 25%",
+            "pulling abc123 29%",
+            "verifying sha256",
+        ] {
+            if let Some(line) = pull_progress_print(text, &mut kind, &mut milestone) {
+                seen.push(line.to_string());
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                "pulling manifest",
+                "pulling abc123 5%",
+                "pulling abc123 15%",
+                "pulling abc123 25%",
+                "verifying sha256",
+            ]
+        );
     }
 }

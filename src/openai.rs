@@ -1370,6 +1370,74 @@ impl Client {
         });
         futures_util::future::join_all(futures).await
     }
+
+    /// Pulls a model through Ollama's native `/api/pull` (NDJSON streaming),
+    /// forwarding each `status` field to `on_status`. Fails when the endpoint
+    /// is not parseable as an Ollama origin or when the stream reports an
+    /// `error` field.
+    pub async fn pull_model(&self, name: &str, on_status: &mut dyn FnMut(&str)) -> Result<()> {
+        let base = ollama_base_url(&self.endpoint);
+        anyhow::ensure!(
+            !base.is_empty(),
+            "this endpoint does not expose Ollama's /api/pull"
+        );
+        let mut request = self
+            .http
+            .post(format!("{base}/api/pull"))
+            .json(&json!({ "name": name, "stream": true }));
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = response.text().await.unwrap_or_default();
+            bail!(format!("pull failed: HTTP {status} {detail}"));
+        }
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        use futures_util::StreamExt;
+        'streaming: while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=position).collect();
+                let line = String::from_utf8_lossy(&line[..line.len() - 1]);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let payload: Value = match serde_json::from_str(line) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+                if let Some(error) = payload.get("error").and_then(Value::as_str) {
+                    bail!("{error}");
+                }
+                let Some(status) = payload.get("status").and_then(Value::as_str) else {
+                    continue;
+                };
+                // Ollama streams per-layer progress as separate completed/total
+                // fields; render a percent when the raw status lacks one so the
+                // caller can show sparse milestone lines.
+                let text = match (
+                    payload.get("completed").and_then(Value::as_u64),
+                    payload.get("total").and_then(Value::as_u64),
+                ) {
+                    (Some(completed), Some(total)) if total > 0 && !status.contains('%') => {
+                        let percent = (completed.min(total) * 100 / total) as usize;
+                        format!("{status} {percent}%")
+                    }
+                    _ => status.to_string(),
+                };
+                on_status(&text);
+                if status == "success" {
+                    break 'streaming;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A catalog entry from `GET /models`. Optional fields are populated when the
@@ -2210,5 +2278,140 @@ mod tests {
         let tool_calls = completion.message.tool_calls.as_ref().expect("tool calls");
         assert_eq!(tool_calls[0].function.name, "read_file");
         assert!(tool_calls[0].function.arguments.contains("a.txt"));
+    }
+
+    /// `/api/pull` NDJSON streaming: per-event statuses with completed/total
+    /// render a percent, the stream's `error` field fails the pull, and the
+    /// final `success` closes the call.
+    #[tokio::test]
+    async fn pull_model_renders_progress_and_succeeds() {
+        use crate::config::PermissionMode;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let bodies: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let server_bodies = Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            const PULL: &str = "{\"status\":\"pulling manifest\"}\n\
+                {\"status\":\"pulling abc123\",\"completed\":25,\"total\":100}\n\
+                {\"status\":\"pulling abc123 55%\"}\n\
+                {\"status\":\"success\"}\n";
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = vec![0u8; 16 * 1024];
+            let count = socket.read(&mut buffer).await.expect("read");
+            server_bodies
+                .lock()
+                .expect("bodies")
+                .push(String::from_utf8_lossy(&buffer[..count]).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n{}",
+                PULL.len(),
+                PULL
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "qwen3:0.6b".to_string(),
+            context_window: 8192,
+            timeout_ms: 5_000,
+            ollama_think: None,
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        let events: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorder = events.clone();
+        client
+            .pull_model("qwen3:0.6b", &mut |text| {
+                recorder.lock().expect("events").push(text.to_string());
+            })
+            .await
+            .expect("pull");
+        server.await.expect("server task");
+
+        let body_view = bodies.lock().expect("bodies");
+        assert!(
+            body_view[0].starts_with("POST /api/pull"),
+            "pull must use the native API: {}",
+            body_view[0]
+        );
+        assert!(
+            body_view[0].contains("\"name\":\"qwen3:0.6b\""),
+            "pull body carries the model name: {}",
+            body_view[0]
+        );
+        let events_view = events.lock().expect("events");
+        assert_eq!(
+            *events_view,
+            vec![
+                "pulling manifest".to_string(),
+                "pulling abc123 25%".to_string(),
+                "pulling abc123 55%".to_string(),
+                "success".to_string(),
+            ]
+        );
+    }
+
+    /// A stream `error` field must abort the pull with that message.
+    #[tokio::test]
+    async fn pull_model_surfaces_stream_errors() {
+        use crate::config::PermissionMode;
+        use std::path::PathBuf;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            const PULL: &str = "{\"status\":\"pulling manifest\"}\n{\"error\":\"pull model manifest not found\"}\n";
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = vec![0u8; 16 * 1024];
+            let _count = socket.read(&mut buffer).await.expect("read");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\r\n{}",
+                PULL.len(),
+                PULL
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "qwen3:0.6b".to_string(),
+            context_window: 8192,
+            timeout_ms: 5_000,
+            ollama_think: None,
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        let mut seen = 0usize;
+        let error = client
+            .pull_model("nope", &mut |_| seen += 1)
+            .await
+            .expect_err("pull must fail");
+        server.await.expect("server task");
+        assert_eq!(seen, 1, "events before the error still surface");
+        assert!(
+            error.to_string().contains("pull model manifest not found"),
+            "error carries the stream message: {error}"
+        );
     }
 }

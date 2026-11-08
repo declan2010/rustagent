@@ -151,6 +151,10 @@ unstable GPU a smaller window may be safer.
   the chosen model becomes the default for future sessions. Prefix matching
   mirrors MinAgent: exact id, else a case-insensitive prefix (`qwen3` → ambiguous
   list), else error. Non-interactive runs fall back to the printed numbered list.
+  On a **local Ollama endpoint with an empty catalog**, `/model` pulls a small
+  default model (`qwen3:0.6b`) through `POST /api/pull` — sparse progress lines
+  (event kinds + every 10% step) — and re-opens the selector with the refreshed
+  catalog.
 - Persistent bottom footer (ported from MinAgent's scroll-region renderer): truecolor
   status row with model, think level, token usage and a 10-cell meter, activity,
   cumulative `proc` time, and live/final `t/s`; a hints row ending with the workspace
