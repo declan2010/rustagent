@@ -8,6 +8,7 @@ use crate::config::PermissionMode;
 use crate::footer::Footer;
 use crate::input::{self, Input};
 use crate::prompt::{EditorEvent, Session};
+use crate::skills;
 use crate::ui;
 
 /// Outcome of a tool call. `aborted` is set when the user pressed Esc while a
@@ -854,6 +855,57 @@ pub struct ToolInput<'a> {
     pub footer: &'a Footer,
 }
 
+/// Permission bundle handed to the tool executor: terminal mode, skill mode,
+/// and the discovered skills for `load_skill`.
+pub struct ToolContext<'a> {
+    pub root: &'a Path,
+    pub terminal_mode: PermissionMode,
+    pub skills_mode: PermissionMode,
+    pub skills: &'a [skills::Skill],
+}
+
+/// Runs one skill load with MinAgent's permission gate: `ask` waits for a
+/// `[y/N]` approval shown in the footer, `auto` runs directly.
+async fn load_skill(
+    skills: &[skills::Skill],
+    args: &Value,
+    mode: PermissionMode,
+    on_activity: &dyn Fn(&str),
+    mut interactive: Option<ToolInput<'_>>,
+) -> Result<ToolOutcome> {
+    if mode == PermissionMode::Off {
+        bail!("[UNAVAILABLE_TOOL] Tool 'load_skill' is unavailable.");
+    }
+    if mode == PermissionMode::Ask {
+        on_activity("Approval needed");
+        let subject = args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("(unnamed skill)")
+            .to_string();
+        let approved = match interactive.as_mut() {
+            Some(io) => {
+                io.session
+                    .read_permission(io.input, io.footer, "Allow this skill load? ", &subject)
+                    .await
+            }
+            None => true,
+        };
+        if !approved {
+            return Ok(ToolOutcome {
+                result: Ok("Permission denied by the user. The skill was not loaded.".to_string()),
+                aborted: false,
+            });
+        }
+    }
+    on_activity("Loading skill");
+    let result = skills::execute_load_skill(args, skills);
+    Ok(ToolOutcome {
+        result,
+        aborted: false,
+    })
+}
+
 async fn run_terminal(
     root: &Path,
     args: &Value,
@@ -874,11 +926,7 @@ async fn run_terminal(
     if mode == PermissionMode::Ask {
         on_activity("Approval needed");
         let approved = match interactive.as_mut() {
-            Some(io) => {
-                io.session
-                    .read_approval(io.input, io.footer, command)
-                    .await
-            }
+            Some(io) => io.session.read_approval(io.input, io.footer, command).await,
             None => true,
         };
         if !approved {
@@ -1004,11 +1052,9 @@ async fn run_terminal(
             Ok(Err(error)) => bail!("Could not run the command: {error}"),
             Err(_) => {
                 return Ok(ToolOutcome {
-                    result: Ok(
-                        "Exit code: terminated (timeout)\n\
+                    result: Ok("Exit code: terminated (timeout)\n\
                          Command stopped after 120 seconds."
-                            .to_string(),
-                    ),
+                        .to_string()),
                     aborted: false,
                 });
             }
@@ -1049,22 +1095,12 @@ async fn run_terminal(
 
 #[cfg(test)]
 pub async fn execute(
-    root: &Path,
-    terminal_mode: PermissionMode,
+    context: &ToolContext<'_>,
     tools: &[Value],
     name: &str,
     arguments: &str,
 ) -> Result<String> {
-    let outcome = execute_with_activity(
-        root,
-        terminal_mode,
-        tools,
-        name,
-        arguments,
-        &|_| {},
-        None,
-    )
-    .await?;
+    let outcome = execute_with_activity(context, tools, name, arguments, &|_| {}, None).await?;
     outcome.result
 }
 
@@ -1074,8 +1110,7 @@ pub async fn execute(
 /// approval lines, queue prompts, and abort a long terminal command.
 /// `aborted` in the [`ToolOutcome`] signals that the user pressed Esc.
 pub async fn execute_with_activity(
-    root: &Path,
-    terminal_mode: PermissionMode,
+    context: &ToolContext<'_>,
     tools: &[Value],
     name: &str,
     arguments: &str,
@@ -1084,15 +1119,53 @@ pub async fn execute_with_activity(
 ) -> Result<ToolOutcome> {
     let args = validate_arguments(name, arguments, tools)?;
     let outcome: ToolOutcome = match name {
-        "read_file" => ToolOutcome { result: read_file(root, &args), aborted: false },
-        "list_directory" => ToolOutcome { result: list_directory(root, &args), aborted: false },
-        "edit_file" => ToolOutcome { result: edit_file(root, &args), aborted: false },
-        "write_file" => ToolOutcome { result: write_file(root, &args), aborted: false },
-        "delete_file" => ToolOutcome { result: delete_file(root, &args), aborted: false },
-        "delete_directory" => ToolOutcome { result: delete_directory(root, &args), aborted: false },
-        "search_files" => ToolOutcome { result: search_files(root, &args), aborted: false },
+        "read_file" => ToolOutcome {
+            result: read_file(context.root, &args),
+            aborted: false,
+        },
+        "list_directory" => ToolOutcome {
+            result: list_directory(context.root, &args),
+            aborted: false,
+        },
+        "edit_file" => ToolOutcome {
+            result: edit_file(context.root, &args),
+            aborted: false,
+        },
+        "write_file" => ToolOutcome {
+            result: write_file(context.root, &args),
+            aborted: false,
+        },
+        "delete_file" => ToolOutcome {
+            result: delete_file(context.root, &args),
+            aborted: false,
+        },
+        "delete_directory" => ToolOutcome {
+            result: delete_directory(context.root, &args),
+            aborted: false,
+        },
+        "search_files" => ToolOutcome {
+            result: search_files(context.root, &args),
+            aborted: false,
+        },
         "run_terminal" => {
-            run_terminal(root, &args, terminal_mode, on_activity, interactive).await?
+            run_terminal(
+                context.root,
+                &args,
+                context.terminal_mode,
+                on_activity,
+                interactive,
+            )
+            .await?
+        }
+        "load_skill" => {
+            load_skill(
+                context.skills,
+                &args,
+                context.skills_mode,
+                on_activity,
+                interactive,
+            )
+            .await?
         }
         other => bail!("[UNAVAILABLE_TOOL] Tool '{other}' is unavailable."),
     };
@@ -1104,6 +1177,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    async fn run_tool(root: &Path, tools: &[Value], name: &str, arguments: &str) -> Result<String> {
+        execute(
+            &ToolContext {
+                root,
+                terminal_mode: PermissionMode::Off,
+                skills_mode: PermissionMode::Off,
+                skills: &[],
+            },
+            tools,
+            name,
+            arguments,
+        )
+        .await
+    }
+
     fn workspace() -> TempDir {
         TempDir::new().expect("temp dir")
     }
@@ -1113,9 +1201,8 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        let written = execute(
+        let written = run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "write_file",
             r#"{"path":"notes/a.txt","content":"hello world"}"#,
@@ -1123,19 +1210,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(written, "Wrote notes/a.txt.");
-        let read = execute(
-            root,
-            PermissionMode::Off,
-            &tools,
-            "read_file",
-            r#"{"path":"notes/a.txt"}"#,
-        )
-        .await
-        .unwrap();
+        let read = run_tool(root, &tools, "read_file", r#"{"path":"notes/a.txt"}"#)
+            .await
+            .unwrap();
         assert_eq!(read, "hello world");
-        let edited = execute(
+        let edited = run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "edit_file",
             r#"{"path":"notes/a.txt","old_text":"world","new_text":"rust"}"#,
@@ -1143,25 +1223,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(edited, "Updated notes/a.txt.");
-        let read = execute(
-            root,
-            PermissionMode::Off,
-            &tools,
-            "read_file",
-            r#"{"path":"notes/a.txt"}"#,
-        )
-        .await
-        .unwrap();
+        let read = run_tool(root, &tools, "read_file", r#"{"path":"notes/a.txt"}"#)
+            .await
+            .unwrap();
         assert_eq!(read, "hello rust");
-        execute(
-            root,
-            PermissionMode::Off,
-            &tools,
-            "delete_file",
-            r#"{"path":"notes/a.txt"}"#,
-        )
-        .await
-        .unwrap();
+        run_tool(root, &tools, "delete_file", r#"{"path":"notes/a.txt"}"#)
+            .await
+            .unwrap();
         assert!(!root.join("notes/a.txt").exists());
     }
 
@@ -1170,18 +1238,16 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        execute(
+        run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "write_file",
             r#"{"path":"a.txt","content":"x x"}"#,
         )
         .await
         .unwrap();
-        let error = execute(
+        let error = run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "edit_file",
             r#"{"path":"a.txt","old_text":"x","new_text":"y"}"#,
@@ -1196,9 +1262,8 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        let error = execute(
+        let error = run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "write_file",
             r#"{"path":"../escape.txt","content":"x"}"#,
@@ -1213,18 +1278,16 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        execute(
+        run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "write_file",
             r#"{"path":"a.txt","content":"one\ntwo\nthree\n"}"#,
         )
         .await
         .unwrap();
-        let read = execute(
+        let read = run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "read_file",
             r#"{"path":"a.txt","offset":2,"limit":1}"#,
@@ -1240,9 +1303,8 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        execute(
+        run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "write_file",
             r#"{"path":"b.txt","content":"b"}"#,
@@ -1250,7 +1312,7 @@ mod tests {
         .await
         .unwrap();
         fs::create_dir(root.join("A")).unwrap();
-        let listing = execute(root, PermissionMode::Off, &tools, "list_directory", "{}")
+        let listing = run_tool(root, &tools, "list_directory", "{}")
             .await
             .unwrap();
         let lines: Vec<&str> = listing.lines().collect();
@@ -1264,33 +1326,25 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        execute(
+        run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "write_file",
             r#"{"path":"src/needle.txt","content":"a NEEDLE here\n"}"#,
         )
         .await
         .unwrap();
-        execute(
+        run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "write_file",
             r#"{"path":"src/other.txt","content":"nothing\n"}"#,
         )
         .await
         .unwrap();
-        let found = execute(
-            root,
-            PermissionMode::Off,
-            &tools,
-            "search_files",
-            r#"{"query":"needle"}"#,
-        )
-        .await
-        .unwrap();
+        let found = run_tool(root, &tools, "search_files", r#"{"query":"needle"}"#)
+            .await
+            .unwrap();
         assert!(found.contains("[filename] \"src/needle.txt\""));
         assert!(found.contains("[content] \"src/needle.txt\":1:3"));
         assert!(found.contains("complete"));
@@ -1301,24 +1355,17 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        execute(
+        run_tool(
             root,
-            PermissionMode::Off,
             &tools,
             "write_file",
             r#"{"path":"node_modules/a.txt","content":"needle"}"#,
         )
         .await
         .unwrap();
-        let found = execute(
-            root,
-            PermissionMode::Off,
-            &tools,
-            "search_files",
-            r#"{"query":"needle"}"#,
-        )
-        .await
-        .unwrap();
+        let found = run_tool(root, &tools, "search_files", r#"{"query":"needle"}"#)
+            .await
+            .unwrap();
         assert!(found.starts_with("0 results"));
     }
 
@@ -1327,9 +1374,7 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Auto);
-        let error = execute(root, PermissionMode::Auto, &tools, "terminal", "{}")
-            .await
-            .unwrap_err();
+        let error = run_tool(root, &tools, "terminal", "{}").await.unwrap_err();
         assert!(error.to_string().contains("Did you mean 'run_terminal'"));
     }
 
@@ -1338,9 +1383,7 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        let error = execute(root, PermissionMode::Off, &tools, "read_file", "{}")
-            .await
-            .unwrap_err();
+        let error = run_tool(root, &tools, "read_file", "{}").await.unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1353,15 +1396,9 @@ mod tests {
         let workspace = workspace();
         let root = workspace.path();
         let tools = definitions(PermissionMode::Off);
-        let error = execute(
-            root,
-            PermissionMode::Off,
-            &tools,
-            "read_file",
-            r#"{"path":"a","extra":true}"#,
-        )
-        .await
-        .unwrap_err();
+        let error = run_tool(root, &tools, "read_file", r#"{"path":"a","extra":true}"#)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("Unknown argument"));
     }
 
@@ -1379,8 +1416,12 @@ mod tests {
         let root = workspace.path();
         let tools = definitions(PermissionMode::Auto);
         let result = execute(
-            root,
-            PermissionMode::Auto,
+            &ToolContext {
+                root,
+                terminal_mode: PermissionMode::Auto,
+                skills_mode: PermissionMode::Off,
+                skills: &[],
+            },
             &tools,
             "run_terminal",
             r#"{"command":"pwd"}"#,

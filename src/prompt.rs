@@ -526,8 +526,8 @@ impl Session {
             .think
             .clone()
             .unwrap_or_else(|| self.think.clone());
-        let next = next_think_level(current.as_deref(), allowed)
-            .unwrap_or_else(|| "false".to_string());
+        let next =
+            next_think_level(current.as_deref(), allowed).unwrap_or_else(|| "false".to_string());
         self.steering.think = Some(Some(next.clone()));
         next
     }
@@ -630,15 +630,28 @@ impl Session {
         footer: &Footer,
         command: &str,
     ) -> bool {
+        self.read_permission(input, footer, "Allow this command? ", command)
+            .await
+    }
+
+    /// Switches the footer input to a `[y/N]` prompt for any extension
+    /// approval (terminal command, skill load) showing `question` + subject.
+    pub async fn read_permission(
+        &mut self,
+        input: &mut Input,
+        footer: &Footer,
+        question: &str,
+        subject: &str,
+    ) -> bool {
         if !self.interactive {
-            return read_approval_plain(input, command).await;
+            return read_permission_plain(input, question, subject).await;
         }
         self.queue_draft();
         let saved_prompt = self.editor.prompt.clone();
         self.editor.set_prompt("[y/N] ".to_string());
         self.editor.clear();
-        let quoted = serde_json::to_string(command).unwrap_or_else(|_| format!("{command:?}"));
-        println!("Allow this command? {quoted}");
+        let quoted = serde_json::to_string(subject).unwrap_or_else(|_| format!("{subject:?}"));
+        println!("{question}{quoted}");
         self.render(footer);
         let approved = loop {
             match self.next_event(input, footer).await {
@@ -660,10 +673,10 @@ impl Session {
     }
 }
 
-async fn read_approval_plain(input: &mut Input, command: &str) -> bool {
+async fn read_permission_plain(input: &mut Input, question: &str, subject: &str) -> bool {
     let mut stdout = std::io::stdout();
-    let quoted = serde_json::to_string(command).unwrap_or_else(|_| format!("{command:?}"));
-    let _ = write!(stdout, "Allow this command? {quoted}\n[y/N] ");
+    let quoted = serde_json::to_string(subject).unwrap_or_else(|_| format!("{subject:?}"));
+    let _ = write!(stdout, "{question}{quoted}\n[y/N] ");
     let _ = stdout.flush();
     let mut line = String::new();
     while let Some(value) = input.read_byte().await {
@@ -927,7 +940,10 @@ mod tests {
         type_text(&mut editor, "hello");
         assert_eq!(editor.buffer, "hello");
         assert_eq!(editor.cursor, 5);
-        assert_eq!(editor.feed(b'\r', false, false), EditorEvent::Submit("hello".into()));
+        assert_eq!(
+            editor.feed(b'\r', false, false),
+            EditorEvent::Submit("hello".into())
+        );
         assert_eq!(editor.buffer, "");
         assert_eq!(editor.cursor, 0);
     }
@@ -959,7 +975,10 @@ mod tests {
             assert_eq!(event, EditorEvent::None);
         }
         assert_eq!(editor.buffer, "one\ntwo\nthree");
-        assert_eq!(editor.feed(b'\r', false, false), EditorEvent::Submit("one\ntwo\nthree".into()));
+        assert_eq!(
+            editor.feed(b'\r', false, false),
+            EditorEvent::Submit("one\ntwo\nthree".into())
+        );
     }
 
     #[test]

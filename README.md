@@ -92,7 +92,7 @@ Notes:
 | `OPENAI_OLLAMA_THINK` | unset | Enables native `/api/chat` with a think level |
 | `OPENAI_INPUT` | `text,image` | Input modalities |
 | `TERMINAL_MODE` | `ask` | `auto`, `ask`, or `off`; `off` hides `run_terminal` |
-| `SKILLS_MODE` | `off` | Reserved; skills are not ported yet |
+| `SKILLS_MODE` | `off` | `auto`, `ask`, or `off`; discovered `SKILL.md` catalogs enable the `load_skill` tool |
 | `MCP_MODE` | `off` | Reserved; MCP is not ported yet |
 
 On the native Ollama path (`OPENAI_OLLAMA_THINK` set), RustAgent sends
@@ -184,6 +184,26 @@ unstable GPU a smaller window may be safer.
   "Response stopped. You can send a new message.", and returns to `Ready`. Typed-ahead
   keys pressed during a turn are preserved for the next prompt.
 
+## Skills
+
+When `SKILLS_MODE` is `auto` or `ask`, rustagent discovers `SKILL.md` files in
+the same roots as MinAgent:
+
+- The application directory's `skills/<skill-name>/` and `.agents/skills/<skill-name>/`
+- The workspace's `skills/<skill-name>/` and `.agents/skills/<skill-name>/`
+
+Each manifest needs YAML frontmatter with `name` and `description`; the name
+must match its directory (lowercase letters, digits, hyphens). Up to 24 valid
+skills load (`Feature setup` warnings report the rest and any parsing issues).
+The Build system prompt receives the skill catalog bounded to 8 KiB with
+descriptions capped at 160 characters, and the model uses one `load_skill`
+tool: omit `path` to load the instructions, or set it to read a bundled text
+resource. Reads are hardened like MinAgent: no symlinks or hard links, no
+escapes outside the skill directory, 64 KiB per skill file and 32 KiB per
+resource, UTF-8 only. In `ask`, each load waits for a `[y/N]` approval in the
+footer; in `auto` it runs directly; `off` (the default) skips discovery and
+hides the tool.
+
 ## Parity status
 
 | Area | Status |
@@ -201,7 +221,8 @@ unstable GPU a smaller window may be safer.
 | Esc interruption | Ported (cancels streaming and terminal commands) |
 | Build/Plan modes (Tab) | Ported |
 | gpt-oss action-tag tool calls | Ported (parses `<|START_ACTION|>`/`<|START_THINKING|>` text tags) |
-| Skills, MCP, `/init`, image input | Not ported |
+| Skills discovery and `load_skill` | Ported (`SKILL.md` roots like MinAgent; 24-skill/8 KiB catalog budget; `auto` runs loads, `ask` asks `[y/N]`) |
+| MCP, `/init`, image input | Not ported |
 | AGENTS.md loading, evidence ledger | Not ported |
 
 ## Tests

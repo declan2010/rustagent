@@ -7,6 +7,7 @@ mod input;
 mod markdown;
 mod openai;
 mod prompt;
+mod skills;
 mod tools;
 mod types;
 mod ui;
@@ -59,7 +60,9 @@ async fn run() -> Result<()> {
         println!("  SKILLS_MODE          auto, ask, or off (default: off)");
         println!("  MCP_MODE             auto, ask, or off (default: off)");
         println!();
-        println!("In an interactive terminal, Ctrl+T cycles the think states the selected model declares (off, plus its template levels) and Tab toggles Build/Plan mode.");
+        println!(
+            "In an interactive terminal, Ctrl+T cycles the think states the selected model declares (off, plus its template levels) and Tab toggles Build/Plan mode."
+        );
         return Ok(());
     }
     if arguments
@@ -85,7 +88,14 @@ async fn run() -> Result<()> {
     let mut input = Input::spawn();
     let mut session = Session::new(ui::mode_prompt(agent.selected_mode()), interactive);
     session.note_agent_state(agent.selected_mode(), agent.config.ollama_think.clone());
-    ui::print_banner(&agent.config, agent.estimated_tokens());
+    ui::print_banner(&agent.config, agent.estimated_tokens(), agent.skills.len());
+    for warning in &agent.skill_warnings {
+        println!(
+            "{} {}",
+            ui::warning_bold("Feature setup"),
+            ui::muted(warning)
+        );
+    }
     agent.render_ready(&footer);
     session.render(&footer);
 
@@ -126,20 +136,16 @@ async fn run() -> Result<()> {
                 EditorEvent::Submit(text) => (text, false),
                 EditorEvent::ToggleMode => {
                     agent.toggle_mode(&footer);
-                    session.note_agent_state(
-                        agent.selected_mode(),
-                        agent.config.ollama_think.clone(),
-                    );
+                    session
+                        .note_agent_state(agent.selected_mode(), agent.config.ollama_think.clone());
                     session.set_prompt(ui::mode_prompt(agent.selected_mode()));
                     session.render(&footer);
                     continue;
                 }
                 EditorEvent::CycleThink => {
                     cycle_think(&mut agent, &footer);
-                    session.note_agent_state(
-                        agent.selected_mode(),
-                        agent.config.ollama_think.clone(),
-                    );
+                    session
+                        .note_agent_state(agent.selected_mode(), agent.config.ollama_think.clone());
                     session.render(&footer);
                     continue;
                 }
@@ -252,8 +258,10 @@ fn on_prompt_action(
                         agent.config.model
                     ))
                 } else {
-                    let next =
-                        agent::next_think_level(agent.config.ollama_think.as_deref(), allowed.as_deref());
+                    let next = agent::next_think_level(
+                        agent.config.ollama_think.as_deref(),
+                        allowed.as_deref(),
+                    );
                     agent.config.ollama_think = next;
                     agent.client.ollama_think = agent.config.ollama_think.clone();
                     agent.set_activity(footer, "Ready", agent.last_rate);
@@ -293,7 +301,7 @@ async fn handle_input(
         "/new" => {
             agent.reset();
             ui::clear_screen();
-            ui::print_banner(&agent.config, agent.estimated_tokens());
+            ui::print_banner(&agent.config, agent.estimated_tokens(), agent.skills.len());
             agent.render_ready(footer);
             return false;
         }
@@ -337,14 +345,18 @@ async fn handle_input(
     }
 }
 
-async fn handle_model(agent: &mut Agent, footer: &Footer, selection: Option<&str>, stdin: &mut Input) {
+async fn handle_model(
+    agent: &mut Agent,
+    footer: &Footer,
+    selection: Option<&str>,
+    stdin: &mut Input,
+) {
     agent.set_activity(footer, "Loading models", agent.last_rate);
     let mut catalog = agent.client.list_models().await;
     // An empty local catalog does not have to be a dead end: pull a small
     // default model and retry the listing once.
     if let Err(error) = &catalog {
-        if agent.is_local_endpoint()
-            && error.to_string().contains("no available model identifiers")
+        if agent.is_local_endpoint() && error.to_string().contains("no available model identifiers")
         {
             match pull_default_and_relist(agent, footer).await {
                 Ok(models) => catalog = Ok(models),
@@ -535,7 +547,10 @@ fn parse_cursor_reply(bytes: &[u8]) -> Option<((u16, u16), usize)> {
                 }
             }
         }
-        if digits[0] == 0 || digits[1] == 0 || cursor >= bytes.len() || bytes[cursor] != b'R'
+        if digits[0] == 0
+            || digits[1] == 0
+            || cursor >= bytes.len()
+            || bytes[cursor] != b'R'
             || digits[0] > 5
             || digits[1] > 5
         {
@@ -622,7 +637,10 @@ async fn apply_model_switch(agent: &mut Agent, footer: &Footer, entry: &ModelEnt
     }
     match agent.switch_model(entry) {
         Ok((known_context, known_input)) => {
-            println!("{}", ui::success_bold(&format!("Model switched to {}.", entry.id)));
+            println!(
+                "{}",
+                ui::success_bold(&format!("Model switched to {}.", entry.id))
+            );
             // Look up the model's reasoning support right away so the user
             // sees which think states are actually valid from now on.
             let think = agent.client.think_info_for(&entry.id).await;
@@ -632,7 +650,8 @@ async fn apply_model_switch(agent: &mut Agent, footer: &Footer, entry: &ModelEnt
                         .to_string(),
                 ),
                 Some(info) if info.levels.is_empty() => Some(
-                    "· thinking: plain on/off (the template declares no effort levels.)".to_string(),
+                    "· thinking: plain on/off (the template declares no effort levels.)"
+                        .to_string(),
                 ),
                 Some(info) => {
                     let default = info

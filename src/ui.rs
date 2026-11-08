@@ -22,9 +22,8 @@ fn use_color() -> bool {
     // TTY status and NO_COLOR are fixed for the life of the process; caching
     // avoids an ioctl plus getenv on every styled segment while streaming.
     static USE_COLOR: OnceLock<bool> = OnceLock::new();
-    *USE_COLOR.get_or_init(|| {
-        std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-    })
+    *USE_COLOR
+        .get_or_init(|| std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
 }
 
 pub fn styled(text: &str, color: (u8, u8, u8), bold: bool) -> String {
@@ -140,7 +139,10 @@ pub fn model_panel(
         if let Some(note) = notes.get(index).filter(|note| !note.is_empty()) {
             label.push_str(note);
         }
-        let label = label.chars().filter(|c| !c.is_control()).collect::<String>();
+        let label = label
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>();
         let budget = columns.saturating_sub(6).max(1);
         let mut shown = String::new();
         let mut width = 0usize;
@@ -212,11 +214,17 @@ pub fn format_elapsed(duration: Duration) -> String {
 
 fn panel_line(content: &str, color: (u8, u8, u8), inner: usize) {
     let padding = " ".repeat(inner.saturating_sub(UnicodeWidthStr::width(content)));
-    println!("{} {} {} {}", cyan("│"), styled(content, color, false), padding, cyan("│"));
+    println!(
+        "{} {} {} {}",
+        cyan("│"),
+        styled(content, color, false),
+        padding,
+        cyan("│")
+    );
 }
 
 /// Startup panel, mirroring MinAgent's model/context/input/terminal/workspace rows.
-pub fn print_banner(config: &Config, used_tokens: u64) {
+pub fn print_banner(config: &Config, used_tokens: u64, skills_loaded: usize) {
     let window = config.context_window.max(1);
     let percent = used_tokens as f64 / window as f64 * 100.0;
     let mut rows = vec![
@@ -232,15 +240,23 @@ pub fn print_banner(config: &Config, used_tokens: u64) {
             ),
         ),
         ("Input", config.input_modalities.join(" · ")),
-        ("Terminal", permission_label(config.terminal_mode).to_string()),
+        (
+            "Terminal",
+            permission_label(config.terminal_mode).to_string(),
+        ),
         ("Workspace", config.workspace_name.clone()),
     ];
     if config.skills_mode != PermissionMode::Off || config.mcp_mode != PermissionMode::Off {
         rows.push((
             "Extensions",
             format!(
-                "Skills {} · MCP {}",
+                "Skills {}{} · MCP {}",
                 permission_label(config.skills_mode),
+                if config.skills_mode != PermissionMode::Off {
+                    format!(" ({skills_loaded} loaded)")
+                } else {
+                    String::new()
+                },
                 permission_label(config.mcp_mode)
             ),
         ));
@@ -248,7 +264,10 @@ pub fn print_banner(config: &Config, used_tokens: u64) {
 
     let title = "RustAgent · SESSION".to_string();
     let contents: Vec<String> = std::iter::once(title.clone())
-        .chain(rows.iter().map(|(label, value)| format!("{label:<10} {value}")))
+        .chain(
+            rows.iter()
+                .map(|(label, value)| format!("{label:<10} {value}")),
+        )
         .collect();
     let max_inner = terminal_columns().saturating_sub(4).max(4);
     let inner = contents
@@ -266,7 +285,8 @@ pub fn print_banner(config: &Config, used_tokens: u64) {
     for (label, value) in &rows {
         let content = format!("{label:<10} {value}");
         if UnicodeWidthStr::width(content.as_str()) <= inner {
-            let padding = " ".repeat(inner.saturating_sub(UnicodeWidthStr::width(content.as_str())));
+            let padding =
+                " ".repeat(inner.saturating_sub(UnicodeWidthStr::width(content.as_str())));
             println!(
                 "{} {} {}{} {}",
                 cyan("│"),
@@ -355,9 +375,21 @@ pub fn print_submitted(prompt: &str, text: &str) {
 
 pub fn print_help() {
     println!("{}", magenta_bold("╭─ COMMANDS"));
-    println!("  {} {}", cyan_bold("/new     "), pale("Start a new conversation and clear the screen"));
-    println!("  {} {}", cyan_bold("/model   "), pale("List or switch API models (/model <number|name>)"));
-    println!("  {} {}", cyan_bold("/compact "), pale("Compact conversation history manually"));
+    println!(
+        "  {} {}",
+        cyan_bold("/new     "),
+        pale("Start a new conversation and clear the screen")
+    );
+    println!(
+        "  {} {}",
+        cyan_bold("/model   "),
+        pale("List or switch API models (/model <number|name>)")
+    );
+    println!(
+        "  {} {}",
+        cyan_bold("/compact "),
+        pale("Compact conversation history manually")
+    );
     println!("  {} {}", cyan_bold("/help    "), pale("Show this help"));
     println!("  {} {}", cyan_bold("/exit    "), pale("Exit RustAgent"));
     println!("{}", muted("╰─ Enter to send · / for commands"));
@@ -381,7 +413,10 @@ mod tests {
         assert_eq!(usage_meter(0.0, 10), "░".repeat(10));
         assert_eq!(usage_meter(100.0, 10), "█".repeat(10));
         assert_eq!(usage_meter(150.0, 10), "█".repeat(10));
-        assert_eq!(usage_meter(50.0, 10), format!("{}{}", "█".repeat(5), "░".repeat(5)));
+        assert_eq!(
+            usage_meter(50.0, 10),
+            format!("{}{}", "█".repeat(5), "░".repeat(5))
+        );
     }
 
     #[test]

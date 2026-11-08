@@ -11,6 +11,7 @@ use crate::input::{self, Input};
 use crate::markdown::MarkdownRenderer;
 use crate::openai::{Client, ModelEntry};
 use crate::prompt::{EditorEvent, Session, Steering};
+use crate::skills;
 use crate::tools::{self, ToolOutcome};
 use crate::types::{Message, Usage};
 use crate::ui;
@@ -126,7 +127,7 @@ fn build_compaction_transcript(messages: &[Message], previous_summary: &str) -> 
     }
 }
 
-fn build_system_prompt(config: &Config, mode: Mode) -> String {
+fn build_system_prompt(config: &Config, mode: Mode, skill_context: &str) -> String {
     let mut sections = vec![
         COMMON_PROMPT.to_string(),
         format!(
@@ -141,6 +142,19 @@ fn build_system_prompt(config: &Config, mode: Mode) -> String {
     ];
     if mode == Mode::Build && config.terminal_mode != PermissionMode::Off {
         sections.push(terminal_guidance(config.terminal_mode));
+    }
+    if mode == Mode::Build && config.skills_mode != PermissionMode::Off && !skill_context.is_empty()
+    {
+        sections.push(format!(
+            "Skills: {}; {}.",
+            config.skills_mode.as_str(),
+            if config.skills_mode == PermissionMode::Ask {
+                "approve each load"
+            } else {
+                "no approval required"
+            }
+        ));
+        sections.push(skill_context.to_string());
     }
     sections.join(" ")
 }
@@ -234,6 +248,7 @@ fn tool_activity(name: &str) -> String {
         "delete_file" => "Delete file",
         "delete_directory" => "Delete directory",
         "run_terminal" => "Terminal",
+        "load_skill" => "Skill",
         other => return format!("Running Tool {other}"),
     };
     format!("Running {label}")
@@ -251,7 +266,10 @@ pub fn resolve_selection(catalog: &[ModelEntry], selection: &str) -> Result<Mode
         if index >= 1 && index <= catalog.len() {
             return Ok(catalog[index - 1].clone());
         }
-        bail!("Selection #{trimmed} is out of range (1-{}).", catalog.len());
+        bail!(
+            "Selection #{trimmed} is out of range (1-{}).",
+            catalog.len()
+        );
     }
     if let Some(entry) = catalog.iter().find(|entry| entry.id == trimmed) {
         return Ok(entry.clone());
@@ -280,7 +298,10 @@ pub fn resolve_selection(catalog: &[ModelEntry], selection: &str) -> Result<Mode
 fn dynamic_suffix(proc_time: Duration, rate: Option<f64>) -> String {
     let mut parts = Vec::new();
     if proc_time >= Duration::from_secs(1) {
-        parts.push(ui::muted(&format!("proc {}", ui::format_elapsed(proc_time))));
+        parts.push(ui::muted(&format!(
+            "proc {}",
+            ui::format_elapsed(proc_time)
+        )));
     }
     if let Some(rate) = format_tokens_per_second(rate) {
         parts.push(ui::muted(&rate));
@@ -382,7 +403,12 @@ pub(crate) fn next_think_level(
     };
     match current.and_then(|value| cycle.iter().position(|level| level == value)) {
         Some(index) => Some(cycle[(index + 1) % cycle.len()].clone()),
-        None => Some(cycle.first().cloned().unwrap_or_else(|| "false".to_string())),
+        None => Some(
+            cycle
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "false".to_string()),
+        ),
     }
 }
 
@@ -390,6 +416,9 @@ pub struct Agent {
     pub config: Config,
     pub client: Client,
     pub tools: Vec<Value>,
+    pub skills: Vec<skills::Skill>,
+    pub skill_context: String,
+    pub skill_warnings: Vec<String>,
     pub messages: Vec<Message>,
     pub totals: Usage,
     pub last_rate: Option<f64>,
@@ -409,14 +438,32 @@ pub struct Agent {
 impl Agent {
     pub fn new(config: Config) -> Result<Self> {
         let client = Client::new(&config)?;
-        let tools = tools::definitions(config.terminal_mode);
-        let system_prompt = build_system_prompt(&config, Mode::Build);
+        // Skill discovery happens once at startup for `auto`/`ask` modes;
+        // discovered skills add the load_skill tool and their catalog joins
+        // the Build system prompt.
+        let (skills, skill_warnings) = if config.skills_mode != PermissionMode::Off {
+            let roots = skills::skill_roots(&config.root);
+            skills::discover(&roots)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut tools = tools::definitions(config.terminal_mode);
+        let skill_context = if !skills.is_empty() {
+            skills::push_tool(&mut tools);
+            skills::format_context(&skills)
+        } else {
+            String::new()
+        };
+        let system_prompt = build_system_prompt(&config, Mode::Build, &skill_context);
         let configured_context_window = config.context_window;
         let configured_input_modalities = config.input_modalities.clone();
         Ok(Self {
             config,
             client,
             tools,
+            skills,
+            skill_context,
+            skill_warnings,
             messages: vec![Message::system(system_prompt)],
             totals: Usage::default(),
             last_rate: None,
@@ -470,7 +517,7 @@ impl Agent {
     /// compacted-conversation checkpoint.
     fn system_prompt(&self) -> String {
         system_prompt_with_summary(
-            build_system_prompt(&self.config, self.effective_mode()),
+            build_system_prompt(&self.config, self.effective_mode(), &self.skill_context),
             &self.compacted_summary,
         )
     }
@@ -549,7 +596,9 @@ impl Agent {
         let known_input = raw_modalities
             .map(|modalities| {
                 modalities.iter().any(|item| item == "text")
-                    && modalities.iter().all(|item| item == "text" || item == "image")
+                    && modalities
+                        .iter()
+                        .all(|item| item == "text" || item == "image")
             })
             .unwrap_or(false);
         let input_modalities = if known_input {
@@ -564,7 +613,12 @@ impl Agent {
         } else {
             self.configured_input_modalities.clone()
         };
-        Ok((context_window, input_modalities, known_context.is_some(), known_input))
+        Ok((
+            context_window,
+            input_modalities,
+            known_context.is_some(),
+            known_input,
+        ))
     }
 
     /// Switches to a catalog entry, applying its settings and resetting context
@@ -762,7 +816,8 @@ impl Agent {
             let mut tail: Vec<char> = Vec::new();
             let mut width = 0;
             for character in path.chars().rev() {
-                let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                let character_width =
+                    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
                 if width + character_width > budget {
                     break;
                 }
@@ -820,7 +875,13 @@ impl Agent {
             let mut on_tool_call = |_name: &str| {};
             let result = self
                 .client
-                .complete(&request, None, &mut on_text, &mut on_reasoning, &mut on_tool_call)
+                .complete(
+                    &request,
+                    None,
+                    &mut on_text,
+                    &mut on_reasoning,
+                    &mut on_tool_call,
+                )
                 .await;
             if let Err(error) = result {
                 if !summary.is_empty() && !summary.ends_with('\n') {
@@ -848,7 +909,9 @@ impl Agent {
         let transcript = self.compaction_transcript(&self.messages[1..]);
 
         self.set_activity(footer, "Compacting context", self.last_rate);
-        let summary = self.generate_compaction_summary(&transcript, footer).await?;
+        let summary = self
+            .generate_compaction_summary(&transcript, footer)
+            .await?;
         self.compacted_summary = summary;
         let system_prompt = self.system_prompt();
         self.messages = vec![Message::system(system_prompt)];
@@ -866,7 +929,9 @@ impl Agent {
         let estimated = self.context_usage().0;
 
         let fixed_context_tokens = self.system_tokens()
-            + estimate_text_tokens(&serde_json::to_string(&self.active_tools()).unwrap_or_default());
+            + estimate_text_tokens(
+                &serde_json::to_string(&self.active_tools()).unwrap_or_default(),
+            );
         if fixed_context_tokens >= threshold {
             bail!(
                 "Fixed context (system prompt, tool schemas), about {} tokens, exceeds the automatic compaction budget of {} tokens. Try to increase OPENAI_CONTEXT_WINDOW or set TERMINAL_MODE=off.",
@@ -881,7 +946,9 @@ impl Agent {
         let conversation: Vec<Message> = self.messages[1..].to_vec();
         let cut_index = find_compaction_cut_point(&conversation, keep_recent);
         if cut_index == 0 {
-            bail!("The current request and recent conversation exceed the compaction threshold; send a shorter request or reduce the retained conversation.");
+            bail!(
+                "The current request and recent conversation exceed the compaction threshold; send a shorter request or reduce the retained conversation."
+            );
         }
         println!();
         println!(
@@ -894,7 +961,9 @@ impl Agent {
         println!("{}", ui::muted("Summarizing earlier history."));
         let transcript = self.compaction_transcript(&conversation[..cut_index]);
         self.set_activity(footer, "Compacting context", self.last_rate);
-        let summary = self.generate_compaction_summary(&transcript, footer).await?;
+        let summary = self
+            .generate_compaction_summary(&transcript, footer)
+            .await?;
         self.compacted_summary = summary;
         let system_prompt = self.system_prompt();
         let recent: Vec<Message> = conversation[cut_index..].to_vec();
@@ -1200,9 +1269,14 @@ impl Agent {
                     self.set_activity(footer, activity, self.last_rate);
                 };
                 let outcome: ToolOutcome = {
+                    let context = tools::ToolContext {
+                        root: &self.config.root,
+                        terminal_mode: self.config.terminal_mode,
+                        skills_mode: self.config.skills_mode,
+                        skills: &self.skills,
+                    };
                     let future = tools::execute_with_activity(
-                        &self.config.root,
-                        self.config.terminal_mode,
+                        &context,
                         &request_tools,
                         &call.function.name,
                         &call.function.arguments,
@@ -1319,7 +1393,9 @@ mod tests {
         let transcript = build_compaction_transcript(&messages, "");
         assert!(!transcript.contains("<previous-summary>"));
         let transcript = build_compaction_transcript(&messages, "older history");
-        assert!(transcript.starts_with("<previous-summary>\nolder history\n</previous-summary>\n\n"));
+        assert!(
+            transcript.starts_with("<previous-summary>\nolder history\n</previous-summary>\n\n")
+        );
         assert!(transcript.contains("user: new turn"));
     }
 
@@ -1336,4 +1412,49 @@ mod tests {
         let huge_transcript = build_transcript(&huge);
         assert!(huge_transcript.contains("[transcript truncated]"));
     }
+
+    fn skills_config(mode: PermissionMode) -> Config {
+        use std::path::PathBuf;
+        Config {
+            endpoint: "http://127.0.0.1:1/v1/chat/completions".to_string(),
+            api_key: None,
+            model: "test".to_string(),
+            context_window: 8192,
+            timeout_ms: 0,
+            ollama_think: None,
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: mode,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_mode_prompt_carries_the_skills_section() {
+        let config = skills_config(PermissionMode::Auto);
+        let context =
+            "Available skills; load relevant instructions as needed:\n- \"demo\": \"A skill\"";
+        let prompt = build_system_prompt(&config, Mode::Build, context);
+        assert!(prompt.contains("Skills: auto; no approval required."));
+        assert!(prompt.contains("- \"demo\": \"A skill\""));
+        // Plan mode never advertises skills, matching MinAgent.
+        let plan = build_system_prompt(&config, Mode::Plan, context);
+        assert!(!plan.contains("Skills:"));
+        assert!(!plan.contains("- \"demo\""));
+        // Without discovered skills nothing is injected.
+        let empty = build_system_prompt(&config, Mode::Build, "");
+        assert!(!empty.contains("Skills:"));
+    }
+
+    #[test]
+    fn ask_mode_prompt_says_approvals_are_needed() {
+        let config = skills_config(PermissionMode::Ask);
+        let context =
+            "Available skills; load relevant instructions as needed:\n- \"demo\": \"A skill\"";
+        let prompt = build_system_prompt(&config, Mode::Build, context);
+        assert!(prompt.contains("Skills: ask; approve each load."));
+    }
+
 }
