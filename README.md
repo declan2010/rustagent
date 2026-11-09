@@ -95,6 +95,12 @@ exists.
 
 ## Configuration
 
+The startup banner's `Config` row names the `.env` files that actually
+contributed values for the session (`.env + ~/.config/rustagent/.env`, or
+`none (environment variables)`), following the first-value-wins precedence:
+process environment, project `.env`, `~/.config/rustagent/.env`, `.env` next
+to the binary.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |

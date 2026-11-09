@@ -1746,6 +1746,7 @@ mod tests {
             context_window: 8192,
             timeout_ms: 0,
             max_rounds: 32,
+            config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
             terminal_mode: PermissionMode::Off,

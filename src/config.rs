@@ -42,6 +42,9 @@ pub struct Config {
     pub terminal_mode: PermissionMode,
     pub skills_mode: PermissionMode,
     pub mcp_mode: PermissionMode,
+    /// The `.env` files that contributed values, joined for the banner's
+    /// Config row (`.env + ~/.config/rustagent/.env`).
+    pub config_files: String,
     pub root: PathBuf,
     pub workspace_name: String,
 }
@@ -75,13 +78,31 @@ fn parse_env_file(contents: &str) -> HashMap<String, String> {
 }
 
 /// Process environment wins over `.env`, matching MinAgent's `loadEnvFile` behavior.
-fn load_env(path: &Path, env: &mut HashMap<String, String>) {
+fn load_env(path: &Path, env: &mut HashMap<String, String>) -> usize {
     let Ok(contents) = std::fs::read_to_string(path) else {
-        return;
+        return 0;
     };
+    let mut inserted = 0;
     for (key, value) in parse_env_file(&contents) {
-        env.entry(key).or_insert(value);
+        // First value loaded wins; a file only counts as a source when it
+        // actually contributed a value.
+        if !env.contains_key(&key) {
+            env.insert(key, value);
+            inserted += 1;
+        }
     }
+    inserted
+}
+
+/// A display path with the home directory abbreviated to `~` so the banner's
+/// Config row stays short (`~/.config/rustagent/.env`).
+fn display_path(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(rest) = path.strip_prefix(Path::new(&home)) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
 }
 
 fn positive_integer(value: Option<&String>, name: &str, fallback: u64) -> Result<u64> {
@@ -221,18 +242,30 @@ pub fn load() -> Result<Config> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     // Precedence (highest first): process environment, project `.env`, user config,
     // `.env` next to the binary. First value loaded wins.
-    load_env(Path::new(".env"), &mut env);
+    let mut config_files: Vec<String> = Vec::new();
+    if load_env(Path::new(".env"), &mut env) > 0 {
+        config_files.push(".env".to_string());
+    }
     if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
     {
-        load_env(&config_home.join("rustagent").join(".env"), &mut env);
+        let path = config_home.join("rustagent").join(".env");
+        if load_env(&path, &mut env) > 0 {
+            config_files.push(display_path(&path));
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(directory) = exe.parent() {
-            load_env(&directory.join(".env"), &mut env);
+            let path = directory.join(".env");
+            if load_env(&path, &mut env) > 0 {
+                config_files.push(display_path(&path));
+            }
             if let Some(parent) = directory.parent() {
-                load_env(&parent.join(".env"), &mut env);
+                let path = parent.join(".env");
+                if load_env(&path, &mut env) > 0 {
+                    config_files.push(display_path(&path));
+                }
             }
         }
     }
@@ -293,6 +326,7 @@ pub fn load() -> Result<Config> {
             "MCP_MODE",
             "off",
         )?,
+        config_files: config_files.join(" + "),
         root,
         workspace_name,
     })
@@ -317,6 +351,39 @@ mod tests {
             "https://api.example.com/v1/chat/completions"
         );
         assert!(make_endpoint("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn load_env_counts_only_the_values_a_file_actually_contributed() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "A=1\nB=2\n").expect("seed");
+        let mut env: std::collections::HashMap<String, String> =
+            [("A".to_string(), "from process".to_string())]
+                .into_iter()
+                .collect();
+        // A is already taken by the process environment; only B counts.
+        assert_eq!(load_env(&path, &mut env), 1);
+        assert_eq!(env.get("A").unwrap(), "from process");
+        assert_eq!(env.get("B").unwrap(), "2");
+        // A second pass contributes nothing: first value loaded wins.
+        assert_eq!(load_env(&path, &mut env), 0);
+        // A missing file is not a source.
+        assert_eq!(load_env(&dir.path().join("nope"), &mut env), 0);
+    }
+
+    #[test]
+    fn display_path_abbreviates_the_home_directory() {
+        let home = std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_else(|_| "/home/tester".to_string()),
+        );
+        let path = home.join(".config").join("rustagent").join(".env");
+        assert_eq!(display_path(&path), "~/.config/rustagent/.env");
+        assert_eq!(
+            display_path(std::path::Path::new("/opt/project/.env")),
+            "/opt/project/.env"
+        );
     }
 
     #[test]

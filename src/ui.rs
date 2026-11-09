@@ -264,6 +264,14 @@ pub fn print_banner(config: &Config, used_tokens: u64, skills_loaded: usize, mcp
             permission_label(config.terminal_mode).to_string(),
         ),
         ("Workspace", config.workspace_name.clone()),
+        (
+            "Config",
+            if config.config_files.is_empty() {
+                "none (environment variables)".to_string()
+            } else {
+                config.config_files.clone()
+            },
+        ),
     ];
     if config.skills_mode != PermissionMode::Off || config.mcp_mode != PermissionMode::Off {
         rows.push((
