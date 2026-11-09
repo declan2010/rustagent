@@ -18,7 +18,7 @@ use std::io::{IsTerminal, Write};
 
 use crate::agent::{Mode, next_think_level};
 use crate::footer::Footer;
-use crate::input::Input;
+use crate::input::{self, Input};
 use crate::ui;
 
 /// Which prompt-level key the user pressed (cooked fallback callback).
@@ -604,15 +604,24 @@ impl Session {
             return EditorEvent::Exit;
         }
         loop {
-            let Some(byte) = input.read_byte().await else {
-                return EditorEvent::Exit;
+            let event = match input::read_event(input).await {
+                Some(input::InputEvent::Byte(byte)) => {
+                    let bulk = input.is_bulk();
+                    let more = input.has_more_in_chunk();
+                    let event = self.editor.feed(byte, bulk, more);
+                    if !more {
+                        self.render(footer);
+                    }
+                    event
+                }
+                Some(input::InputEvent::Resized) => {
+                    // A terminal resize re-renders the whole footer (region,
+                    // status, hints, input) at the new geometry.
+                    footer.refresh();
+                    EditorEvent::None
+                }
+                None => return EditorEvent::Exit,
             };
-            let bulk = input.is_bulk();
-            let more = input.has_more_in_chunk();
-            let event = self.editor.feed(byte, bulk, more);
-            if !more {
-                self.render(footer);
-            }
             if !event.is_none() {
                 return event;
             }

@@ -13,16 +13,30 @@
 
 use std::collections::VecDeque;
 use std::io::IsTerminal;
+use std::time::Duration;
 
+use terminal_size::{Height, Width, terminal_size};
 use tokio::sync::mpsc;
 
-struct Chunk {
-    bytes: Vec<u8>,
-    bulk: bool,
+/// One item on the input stream: stdin bytes (with their paste
+/// classification) or a notice that the terminal size changed.
+enum StreamItem {
+    Bytes { bytes: Vec<u8>, bulk: bool },
+    Resized,
 }
 
+/// One input item for event-driven consumers: a keystroke byte or a notice
+/// that the terminal was resized.
+pub enum InputEvent {
+    Byte(u8),
+    Resized,
+}
+
+/// How often the resize watcher polls the terminal size.
+const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 pub struct Input {
-    rx: mpsc::UnboundedReceiver<Chunk>,
+    rx: mpsc::UnboundedReceiver<StreamItem>,
     pending: VecDeque<u8>,
     current: VecDeque<u8>,
     current_bulk: bool,
@@ -33,7 +47,11 @@ impl Input {
     /// epoll-integrated `AsyncFd` so the task cancels cleanly on shutdown instead
     /// of leaving a blocking read thread behind.
     pub fn spawn() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel::<Chunk>();
+        let (sender, receiver) = mpsc::unbounded_channel::<StreamItem>();
+        // Reports terminal-size changes so the UI re-renders at the new
+        // geometry; MinAgent leaves resizes to readline, but here the notice
+        // rides the same input stream the editor already selects on.
+        spawn_resize_watcher(sender.clone());
         #[cfg(unix)]
         let reader = async_fd_stdin();
         #[cfg(unix)]
@@ -52,7 +70,7 @@ impl Input {
                             let bytes = buffer[..count].to_vec();
                             // An escape-prefixed chunk is a key sequence, not a paste.
                             let bulk = count > 1 && bytes.first() != Some(&0x1b);
-                            if sender.send(Chunk { bytes, bulk }).is_err() {
+                            if sender.send(StreamItem::Bytes { bytes, bulk }).is_err() {
                                 return;
                             }
                         }
@@ -79,7 +97,8 @@ impl Input {
         }
     }
 
-    /// Next byte: any pushed-back bytes first, then the stream.
+    /// Next byte: any pushed-back bytes first, then the stream. Resize
+    /// notices are skipped here; [`read_event`] surfaces them instead.
     pub async fn read_byte(&mut self) -> Option<u8> {
         if let Some(byte) = self.pending.pop_front() {
             return Some(byte);
@@ -88,9 +107,13 @@ impl Input {
             if let Some(byte) = self.current.pop_front() {
                 return Some(byte);
             }
-            let chunk = self.rx.recv().await?;
-            self.current = chunk.bytes.into();
-            self.current_bulk = chunk.bulk;
+            match self.rx.recv().await? {
+                StreamItem::Bytes { bytes, bulk } => {
+                    self.current = bytes.into();
+                    self.current_bulk = bulk;
+                }
+                StreamItem::Resized => continue,
+            }
         }
     }
 
@@ -125,7 +148,54 @@ pub async fn read_chunk(input: &mut Input) -> Option<(u8, bool, bool)> {
     Some((byte, input.is_bulk(), input.has_more_in_chunk()))
 }
 
-fn spawn_blocking_stdin(sender: mpsc::UnboundedSender<Chunk>) {
+/// Next byte or resize notice: unlike [`read_chunk`], a resize wakes the
+/// waiter instead of waiting behind the next keystroke, so an idle prompt
+/// re-renders immediately after a terminal resize.
+pub async fn read_event(input: &mut Input) -> Option<InputEvent> {
+    if let Some(byte) = input.pending.pop_front() {
+        return Some(InputEvent::Byte(byte));
+    }
+    loop {
+        if let Some(byte) = input.current.pop_front() {
+            return Some(InputEvent::Byte(byte));
+        }
+        match input.rx.recv().await? {
+            StreamItem::Bytes { bytes, bulk } => {
+                input.current = bytes.into();
+                input.current_bulk = bulk;
+            }
+            StreamItem::Resized => return Some(InputEvent::Resized),
+        }
+    }
+}
+
+/// Polls the terminal size and reports every change on the input stream. The
+/// thread exits once the channel closes (application shutdown).
+fn spawn_resize_watcher(sender: mpsc::UnboundedSender<StreamItem>) {
+    std::thread::Builder::new()
+        .name("rustagent-resize".into())
+        .spawn(move || {
+            let mut last = terminal_dimensions();
+            loop {
+                std::thread::sleep(RESIZE_POLL_INTERVAL);
+                let current = terminal_dimensions();
+                if current == last {
+                    continue;
+                }
+                last = current;
+                if sender.send(StreamItem::Resized).is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("spawn resize watcher");
+}
+
+fn terminal_dimensions() -> Option<(u16, u16)> {
+    terminal_size().map(|(Width(width), Height(height))| (width, height))
+}
+
+fn spawn_blocking_stdin(sender: mpsc::UnboundedSender<StreamItem>) {
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut stdin = tokio::io::stdin();
@@ -134,7 +204,7 @@ fn spawn_blocking_stdin(sender: mpsc::UnboundedSender<Chunk>) {
             match stdin.read(&mut byte).await {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    let chunk = Chunk {
+                    let chunk = StreamItem::Bytes {
                         bytes: vec![byte[0]],
                         bulk: false,
                     };

@@ -225,6 +225,19 @@ Conversation turns render like MinAgent's chat bubbles:
   thinking separated and readable, and reasoning that arrives after the
   answer started falls back to plain muted output.
 
+## Terminal resize
+
+MinAgent leaves resizes to readline; RustAgent re-renders on its own:
+
+- A resize watcher reports terminal-size changes on the input stream, so the
+  footer (scroll region, status, hints, input line) redraws at the new
+  geometry immediately — even while idle, without waiting for a keystroke.
+- Frames never exceed the live terminal: every bubble row clamps to the
+  current width, so a resize mid-stream adapts the frame instead of
+  wrapping its rows off-screen. Already-printed history keeps its width
+  (terminals cannot reflow past output), and each new frame picks up the
+  current terminal.
+
 ## Skills
 
 When `SKILLS_MODE` is `auto` or `ask`, rustagent discovers `SKILL.md` files in

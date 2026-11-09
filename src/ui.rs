@@ -468,6 +468,19 @@ impl AssistantBubble {
         bubble
     }
 
+    /// The content width for the row being laid out: the bubble never renders
+    /// wider than the live terminal, so a mid-stream resize adapts the frame
+    /// instead of wrapping its rows off-screen (MinAgent freezes the width
+    /// once per message; here every row clamps to the current terminal).
+    fn live_content_width(&self) -> usize {
+        match terminal_size() {
+            Some((Width(width), _)) => {
+                8.max(self.content_width.min(width.saturating_sub(4) as usize))
+            }
+            None => self.content_width,
+        }
+    }
+
     pub fn write(&mut self, text: &str) {
         if !self.opened {
             self.open();
@@ -515,7 +528,7 @@ impl AssistantBubble {
         self.finish_line();
         let footer_prefix = "╰─";
         let footer_text = format!(" {status} ");
-        let footer_fill = (self.content_width + 4)
+        let footer_fill = (self.live_content_width() + 4)
             .saturating_sub(
                 unicode_width::UnicodeWidthStr::width(footer_prefix)
                     + unicode_width::UnicodeWidthStr::width(footer_text.as_str())
@@ -538,7 +551,8 @@ impl AssistantBubble {
     fn open(&mut self) {
         self.opened = true;
         let title_prefix = "╭─";
-        let budget = self.content_width.saturating_sub(3).max(5);
+        let width = self.live_content_width();
+        let budget = width.saturating_sub(3).max(5);
         let mut shown = String::new();
         let mut used = 0usize;
         for character in self.label.chars() {
@@ -550,7 +564,7 @@ impl AssistantBubble {
             shown.push(character);
         }
         let title_text = format!(" {shown} ");
-        let title_fill = (self.content_width + 4)
+        let title_fill = (width + 4)
             .saturating_sub(
                 unicode_width::UnicodeWidthStr::width(title_prefix)
                     + unicode_width::UnicodeWidthStr::width(title_text.as_str())
@@ -589,7 +603,7 @@ impl AssistantBubble {
             // it over left the wrapped row one column short of the frame.
             let mut carried_whitespace = whitespace_width;
             if self.line_width > 0
-                && self.line_width + whitespace_width + word_width > self.content_width
+                && self.line_width + whitespace_width + word_width > self.live_content_width()
             {
                 self.finish_line();
                 self.pending_whitespace.clear();
@@ -614,7 +628,7 @@ impl AssistantBubble {
 
     fn emit_cluster(&mut self, character: char) {
         let width = character_width(character);
-        if self.line_width > 0 && self.line_width + width > self.content_width {
+        if self.line_width > 0 && self.line_width + width > self.live_content_width() {
             self.finish_line();
         }
         if !self.line_started {
@@ -630,7 +644,7 @@ impl AssistantBubble {
             self.line_started = true;
             self.line_content.clear();
         }
-        let padding = self.content_width.saturating_sub(self.line_width) + 1;
+        let padding = self.live_content_width().saturating_sub(self.line_width) + 1;
         let content = format!(" {}{}", self.line_content, " ".repeat(padding));
         let content = match self.style.background {
             Some(background) => bubble_text(&content, self.style.text, background),

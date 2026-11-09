@@ -245,6 +245,19 @@ impl Footer {
         }
     }
 
+    /// Re-reads the terminal size and redraws at the new geometry; the resize
+    /// watcher routes here so an idle prompt re-renders immediately instead of
+    /// waiting for the next keystroke or activity update.
+    pub fn refresh(&self) {
+        let mut state = self.state.borrow_mut();
+        if !state.active {
+            return;
+        }
+        refresh_size(&mut state);
+        drop(state);
+        self.redraw();
+    }
+
     /// Updates the editable line and the queued-message count in one redraw.
     pub fn set_input(&self, prompt: &str, line: &str, cursor: usize, queued: usize) {
         let mut state = self.state.borrow_mut();
