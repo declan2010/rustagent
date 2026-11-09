@@ -36,6 +36,7 @@ pub struct Config {
     pub model: String,
     pub context_window: u64,
     pub timeout_ms: u64,
+    pub max_rounds: usize,
     pub ollama_think: Option<String>,
     pub input_modalities: Vec<String>,
     pub terminal_mode: PermissionMode,
@@ -273,6 +274,8 @@ pub fn load() -> Result<Config> {
             262_144,
         )?,
         timeout_ms: non_negative_integer(env.get("OPENAI_TIMEOUT_MS"), "OPENAI_TIMEOUT_MS", 0)?,
+        max_rounds: positive_integer(env.get("OPENAI_MAX_ROUNDS"), "OPENAI_MAX_ROUNDS", 32)?
+            as usize,
         ollama_think: parse_ollama_think(env.get("OPENAI_OLLAMA_THINK"))?,
         input_modalities: parse_input_modalities(env.get("OPENAI_INPUT"))?,
         terminal_mode: PermissionMode::parse(
@@ -314,6 +317,26 @@ mod tests {
             "https://api.example.com/v1/chat/completions"
         );
         assert!(make_endpoint("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn max_rounds_defaults_to_32_and_requires_a_positive_integer() {
+        // The default matches MinAgent's MAX_TOOL_ROUNDS.
+        assert_eq!(positive_integer(None, "OPENAI_MAX_ROUNDS", 32).unwrap(), 32);
+        assert_eq!(
+            positive_integer(Some(&"8".to_string()), "OPENAI_MAX_ROUNDS", 32).unwrap(),
+            8
+        );
+        // Zero, negatives, and garbage are rejected so a turn can never
+        // start with an empty round budget.
+        assert!(positive_integer(Some(&"0".to_string()), "OPENAI_MAX_ROUNDS", 32).is_err());
+        assert!(positive_integer(Some(&"-4".to_string()), "OPENAI_MAX_ROUNDS", 32).is_err());
+        assert!(positive_integer(Some(&"many".to_string()), "OPENAI_MAX_ROUNDS", 32).is_err());
+        // Empty falls back to the default like every other setting.
+        assert_eq!(
+            positive_integer(Some(&"".to_string()), "OPENAI_MAX_ROUNDS", 32).unwrap(),
+            32
+        );
     }
 
     #[test]

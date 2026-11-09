@@ -54,6 +54,9 @@ async fn run() -> Result<()> {
         println!("  OPENAI_CONTEXT_WINDOW Context window in tokens (default: 262144)");
         println!("  OPENAI_TIMEOUT_MS    Request timeout in milliseconds (0 disables it)");
         println!(
+            "  OPENAI_MAX_ROUNDS   Tool rounds per message (default: 32); when exhausted the model wraps up in text"
+        );
+        println!(
             "  OPENAI_OLLAMA_THINK  Enables Ollama native /api/chat with the given think level"
         );
         println!("  OPENAI_INPUT         Input modalities: text,image");

@@ -17,7 +17,12 @@ use crate::tools::{self, ToolOutcome};
 use crate::types::{Message, Usage};
 use crate::ui;
 
-const MAX_ROUNDS: usize = 32;
+/// What the model sees when the per-turn tool-round budget is exhausted:
+/// the turn ends with a text-only wrap-up instead of a hard error,
+/// OpenCode's `steps` behavior (MinAgent just stops the turn).
+const TOOL_ROUND_LIMIT_NUDGE: &str = "The tool-round budget for this turn is exhausted; \
+no more tools can run. Summarize in plain text what you have accomplished so far and what \
+remains to be done.";
 
 const COMMON_PROMPT: &str = "You are RustAgent. Reply in the user's language. \
 Ground repository claims in inspected files: locate with list_directory or search_files; inspect with read_file. \
@@ -1153,10 +1158,24 @@ impl Agent {
         let request_tools = self.active_tools();
         let mut repair_attempts = 0usize;
         self.set_activity(footer, "Model generating", self.last_rate);
+        let max_rounds = self.config.max_rounds;
 
-        for round in 0..MAX_ROUNDS {
+        for round in 0..=max_rounds {
             if round > 0 {
                 ui::print_round_separator();
+            }
+            let wrapping_up = round == max_rounds;
+            if wrapping_up {
+                // OpenCode-style wrap-up: the tool budget is gone, so strip
+                // the tools and ask for a text-only summary instead of
+                // failing the turn (MinAgent stops with a hard error).
+                println!(
+                    "{}",
+                    ui::muted(&format!(
+                        "· Tool-round limit of {max_rounds} reached; asking for a text-only wrap-up."
+                    ))
+                );
+                self.messages.push(Message::user(TOOL_ROUND_LIMIT_NUDGE));
             }
             if let Err(error) = self.compact_automatically_if_needed(footer).await {
                 ui::print_error(&error.to_string());
@@ -1245,9 +1264,14 @@ impl Agent {
                         thinking_closed.set(true);
                     }
                 };
+                let tools: Option<&[Value]> = if wrapping_up {
+                    None
+                } else {
+                    Some(request_tools.as_slice())
+                };
                 let future = self.client.complete(
                     &self.messages,
-                    Some(&request_tools),
+                    tools,
                     &mut on_text,
                     &mut on_reasoning,
                     &mut on_tool_call,
@@ -1415,6 +1439,28 @@ impl Agent {
             if tool_calls.is_empty() {
                 self.ready(footer);
                 return Ok(());
+            }
+            if wrapping_up {
+                // The wrap-up request carries no tools; calls that still come
+                // back are answered with an error result and the turn ends.
+                for call in &tool_calls {
+                    let metadata = json!({
+                        "tool": call.function.name,
+                        "status": "error",
+                        "code": "TOOL_ROUND_LIMIT"
+                    });
+                    self.messages.push(Message::tool(
+                        call.id.clone(),
+                        format!(
+                            "Tool result: {metadata}\nError: The tool-round limit for this \
+                             turn was reached; no tools can run. Answer in plain text."
+                        ),
+                    ));
+                }
+                self.ready(footer);
+                bail!(
+                    "Stopped after {max_rounds} tool rounds: the wrap-up request still returned tool calls."
+                );
             }
 
             // Validate the whole batch before running anything. A bad request is
@@ -1610,7 +1656,7 @@ impl Agent {
             self.set_activity(footer, "Model working", self.last_rate);
         }
         self.ready(footer);
-        bail!("Stopped after {MAX_ROUNDS} tool rounds without a final answer.");
+        bail!("Stopped after {max_rounds} tool rounds without a final answer.");
     }
 }
 
@@ -1699,6 +1745,7 @@ mod tests {
             model: "test".to_string(),
             context_window: 8192,
             timeout_ms: 0,
+            max_rounds: 32,
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
             terminal_mode: PermissionMode::Off,
