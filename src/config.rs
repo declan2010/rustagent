@@ -37,6 +37,9 @@ pub struct Config {
     pub context_window: u64,
     pub timeout_ms: u64,
     pub max_rounds: usize,
+    /// How long recoverable endpoint errors keep retrying
+    /// (`OPENAI_RECOVERY_SECONDS`), fed to `endpoint_recovery_delays`.
+    pub recovery_seconds: u64,
     pub ollama_think: Option<String>,
     pub input_modalities: Vec<String>,
     pub terminal_mode: PermissionMode,
@@ -309,6 +312,11 @@ pub fn load() -> Result<Config> {
         timeout_ms: non_negative_integer(env.get("OPENAI_TIMEOUT_MS"), "OPENAI_TIMEOUT_MS", 0)?,
         max_rounds: positive_integer(env.get("OPENAI_MAX_ROUNDS"), "OPENAI_MAX_ROUNDS", 32)?
             as usize,
+        recovery_seconds: positive_integer(
+            env.get("OPENAI_RECOVERY_SECONDS"),
+            "OPENAI_RECOVERY_SECONDS",
+            crate::openai::DEFAULT_ENDPOINT_RECOVERY_SECONDS,
+        )?,
         ollama_think: parse_ollama_think(env.get("OPENAI_OLLAMA_THINK"))?,
         input_modalities: parse_input_modalities(env.get("OPENAI_INPUT"))?,
         terminal_mode: PermissionMode::parse(
@@ -403,6 +411,46 @@ mod tests {
         assert_eq!(
             positive_integer(Some(&"".to_string()), "OPENAI_MAX_ROUNDS", 32).unwrap(),
             32
+        );
+    }
+
+    #[test]
+    fn recovery_seconds_defaults_to_the_endpoint_recovery_window() {
+        // 240s is 4-5 short retries plus minute-long waits, enough for Ollama
+        // to reload a crashed runner without surfacing the failure to the user.
+        assert_eq!(
+            positive_integer(
+                None,
+                "OPENAI_RECOVERY_SECONDS",
+                crate::openai::DEFAULT_ENDPOINT_RECOVERY_SECONDS
+            )
+            .unwrap(),
+            240
+        );
+        assert_eq!(
+            positive_integer(
+                Some(&"600".to_string()),
+                "OPENAI_RECOVERY_SECONDS",
+                crate::openai::DEFAULT_ENDPOINT_RECOVERY_SECONDS
+            )
+            .unwrap(),
+            600
+        );
+        assert!(
+            positive_integer(
+                Some(&"0".to_string()),
+                "OPENAI_RECOVERY_SECONDS",
+                crate::openai::DEFAULT_ENDPOINT_RECOVERY_SECONDS
+            )
+            .is_err()
+        );
+        assert!(
+            positive_integer(
+                Some(&"nope".to_string()),
+                "OPENAI_RECOVERY_SECONDS",
+                crate::openai::DEFAULT_ENDPOINT_RECOVERY_SECONDS
+            )
+            .is_err()
         );
     }
 

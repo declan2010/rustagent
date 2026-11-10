@@ -10,10 +10,32 @@ use crate::types::{Completion, FunctionCall, Message, ToolCall, Usage};
 const MAX_TOOL_ARGUMENT_CHARS: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Backoff schedule for recoverable endpoint errors (connect drops, 429, 5xx,
+/// Opening waits for recoverable endpoint errors (connect drops, 429, 5xx,
 /// non-streaming shape, and streams that end before any delta is emitted).
 /// Mirrors MinAgent's `ENDPOINT_RECOVERY_DELAYS_MS`.
-const ENDPOINT_RECOVERY_DELAYS_MS: [u64; 3] = [5_000, 15_000, 30_000];
+const ENDPOINT_RECOVERY_START_MS: [u64; 3] = [5_000, 15_000, 30_000];
+/// Every wait after the fixed opening schedule: a crashed Ollama runner can
+/// take a minute or more to reload a 20-44 GB model, so additional retries
+/// only make sense spaced at this scale.
+const ENDPOINT_RECOVERY_STEP_MS: u64 = 60_000;
+/// Default duration of the endpoint-recovery window pushed through
+/// `OPENAI_RECOVERY_SECONDS`.
+pub const DEFAULT_ENDPOINT_RECOVERY_SECONDS: u64 = 240;
+
+/// Complete retry schedule for a recovery window: MinAgent's 5s/15s/30s
+/// openings followed by 60s steps while they still fit inside the window.
+/// A crashed model runner therefore gets minutes of patient retries instead
+/// of three short attempts that overlap the model reload and surface a hard
+/// error to the user.
+fn endpoint_recovery_delays(recovery_seconds: u64) -> Vec<u64> {
+    let mut delays: Vec<u64> = ENDPOINT_RECOVERY_START_MS.to_vec();
+    let mut total_seconds = delays.iter().sum::<u64>() / 1000;
+    while total_seconds + ENDPOINT_RECOVERY_STEP_MS / 1000 <= recovery_seconds {
+        delays.push(ENDPOINT_RECOVERY_STEP_MS);
+        total_seconds += ENDPOINT_RECOVERY_STEP_MS / 1000;
+    }
+    delays
+}
 
 /// Classifies an endpoint error as retryable. A stream that ended or errored is
 /// only retryable when no delta was emitted yet, so partial output is never
@@ -24,6 +46,11 @@ fn is_recoverable_endpoint_error(error: &anyhow::Error, emitted_deltas: usize) -
         return true;
     }
     if message.contains("[STREAM_ENDED]") || message.contains("[STREAM_ERROR]") {
+        return emitted_deltas == 0;
+    }
+    // A mid-body connection drop (runner crash sending a reset) is only safe
+    // to retry after nothing was streamed to the UI yet.
+    if message.contains("could not read the streaming response") {
         return emitted_deltas == 0;
     }
     if message.contains("Could not connect to the OpenAI-compatible endpoint") {
@@ -877,6 +904,9 @@ pub struct Client {
     /// Context window used to set Ollama's `num_ctx` on the native `/api/chat`
     /// path so long conversations do not get truncated to Ollama's small default.
     pub context_window: u64,
+    /// How long recoverable endpoint failures keep retrying before the error
+    /// is surfaced, from `OPENAI_RECOVERY_SECONDS`.
+    pub recovery_seconds: u64,
     /// Models that rejected the `think` option with HTTP 400 ("does not
     /// support thinking"): subsequent requests for them omit `think`.
     thinking_disabled: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -905,6 +935,7 @@ impl Client {
             model: config.model.clone(),
             ollama_think: config.ollama_think.clone(),
             context_window: config.context_window,
+            recovery_seconds: config.recovery_seconds,
             thinking_disabled: std::sync::Mutex::new(std::collections::HashSet::new()),
             think_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             show_failed: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1042,22 +1073,27 @@ impl Client {
                         )));
                         continue;
                     }
+                    let recovery_delays = endpoint_recovery_delays(self.recovery_seconds);
                     if !is_recoverable_endpoint_error(&error, emitted_deltas.get())
-                        || attempt >= ENDPOINT_RECOVERY_DELAYS_MS.len()
+                        || attempt >= recovery_delays.len()
                     {
                         return Err(error);
                     }
-                    let delay = ENDPOINT_RECOVERY_DELAYS_MS[attempt];
+                    let delay = recovery_delays[attempt];
                     let kind = if error.to_string().contains("[ENDPOINT_SHAPE]") {
                         "Non-streaming response from"
                     } else {
                         "Unstable endpoint:"
                     };
+                    let window = if attempt == 0 {
+                        format!(" · recovery window {}s", self.recovery_seconds)
+                    } else {
+                        String::new()
+                    };
                     crate::ui::print_info(&crate::ui::warning(&format!(
-                        "· {kind} {target} ({}); retry {}/{} in {}s…",
+                        "· {kind} {target} ({}); retry {} in {}s{window}",
                         truncate(&error.to_string(), 70),
                         attempt + 1,
-                        ENDPOINT_RECOVERY_DELAYS_MS.len(),
                         delay / 1000,
                     )));
                     tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -1734,6 +1770,26 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_recovery_delays_extend_within_the_recovery_window() {
+        // The default window fits the opening schedule plus three 60s waits.
+        assert_eq!(
+            endpoint_recovery_delays(240),
+            vec![5_000, 15_000, 30_000, 60_000, 60_000, 60_000]
+        );
+        // A step is only added when it still fits the window.
+        assert_eq!(
+            endpoint_recovery_delays(110),
+            vec![5_000, 15_000, 30_000, 60_000]
+        );
+        // Small windows keep the three MinAgent waits untouched, as does zero.
+        assert_eq!(endpoint_recovery_delays(50), vec![5_000, 15_000, 30_000]);
+        assert_eq!(endpoint_recovery_delays(0), vec![5_000, 15_000, 30_000]);
+        // Very large windows keep extending in 60s steps (590s of waits at 600).
+        assert_eq!(endpoint_recovery_delays(600).len(), 12);
+        assert_eq!(endpoint_recovery_delays(600).last(), Some(&60_000));
+    }
+
+    #[test]
     fn sse_stream_accumulates_content_and_tool_calls() {
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -1926,6 +1982,7 @@ mod tests {
             context_window: 8192,
             timeout_ms: 5_000,
             max_rounds: 32,
+            recovery_seconds: 240,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
@@ -2033,6 +2090,7 @@ mod tests {
             context_window: 8192,
             timeout_ms: 5_000,
             max_rounds: 32,
+            recovery_seconds: 240,
             config_files: String::new(),
             ollama_think: Some("true".to_string()),
             input_modalities: vec!["text".to_string()],
@@ -2245,6 +2303,7 @@ mod tests {
             context_window: 8192,
             timeout_ms: 5_000,
             max_rounds: 32,
+            recovery_seconds: 240,
             config_files: String::new(),
             ollama_think: Some("low".to_string()),
             input_modalities: vec!["text".to_string()],
@@ -2417,6 +2476,7 @@ mod tests {
             context_window: 8192,
             timeout_ms: 5_000,
             max_rounds: 32,
+            recovery_seconds: 240,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
@@ -2490,6 +2550,7 @@ mod tests {
             context_window: 8192,
             timeout_ms: 5_000,
             max_rounds: 32,
+            recovery_seconds: 240,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
@@ -2558,6 +2619,7 @@ mod context_show_tests {
             context_window: 8192,
             timeout_ms: 5_000,
             max_rounds: 32,
+            recovery_seconds: 240,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],

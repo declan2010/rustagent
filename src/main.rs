@@ -57,6 +57,12 @@ async fn run() -> Result<()> {
             "  OPENAI_MAX_ROUNDS   Tool rounds per message (default: 32); when exhausted the model wraps up in text"
         );
         println!(
+            "  OPENAI_RECOVERY_SECONDS Endpoint-failure recovery window in seconds (default: 240):"
+        );
+        println!(
+            "                      retries continue with wider and wider gaps instead of failing"
+        );
+        println!(
             "  OPENAI_OLLAMA_THINK  Enables Ollama native /api/chat with the given think level"
         );
         println!("  OPENAI_INPUT         Input modalities: text,image");
