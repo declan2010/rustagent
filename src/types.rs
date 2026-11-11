@@ -87,8 +87,8 @@ pub struct Usage {
 pub struct Completion {
     pub message: Message,
     pub usage: Option<Usage>,
-    /// Kept for parity and future abort/length reporting; the parser already rejects
-    /// length/content-filter stops.
-    #[allow(dead_code)]
+    /// The stop reason the endpoint reported ("stop", "length", ...). A
+    /// "length" stop is the designed `OPENAI_NUM_PREDICT` bound: the agent
+    /// keeps the partial text and reports the cap instead of failing.
     pub finish_reason: Option<String>,
 }

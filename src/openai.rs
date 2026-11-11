@@ -850,14 +850,13 @@ impl<'a> StreamParser<'a> {
         if !self.tool_calls.is_empty() {
             message.tool_calls = Some(self.tool_calls.into_values().collect());
         }
-        if self.finish_reason.as_deref() == Some("length") {
-            bail!(
-                "Endpoint stopped at its output token limit; the partial response was discarded."
-            );
-        }
         if self.finish_reason.as_deref() == Some("content_filter") {
             bail!("Endpoint stopped the response because of its content filter.");
         }
+        // A "length" stop keeps the partial text: with OPENAI_NUM_PREDICT the
+        // cap is a designed bound, not a failure. The caller decides what to
+        // do with the truncated turn (the agent reports it and keeps the text
+        // in history); truncated tool calls still flow into the repair path.
         if let Some(calls) = &message.tool_calls {
             for call in calls {
                 if !self.native && call.id.is_empty() {
@@ -2325,6 +2324,35 @@ mod tests {
         );
         let error = parser.finish().unwrap_err();
         assert!(error.to_string().contains("STREAM_ENDED"));
+    }
+
+    #[test]
+    fn length_stop_keeps_the_partial_text() {
+        // OPENAI_NUM_PREDICT makes a "length" stop the designed cap, not a
+        // failure: the streamed text must survive and the finish reason must
+        // reach the agent so it can report the cap and keep the history.
+        let mut text = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_chunk: &str| {};
+        let mut parser = StreamParser::new(
+            &mut on_text,
+            &mut on_reasoning,
+            &mut on_tool_call,
+            false,
+            "application/x-ndjson".to_string(),
+        );
+        parser
+            .feed_ndjson_line(r#"{"message":{"role":"assistant","content":"partial "}}"#)
+            .expect("content chunk");
+        parser
+            .feed_ndjson_line(r#"{"message":{"role":"assistant","content":"answer"},"done":true,"done_reason":"length","eval_count":4096,"prompt_eval_count":256}"#)
+            .expect("done chunk");
+        let completion = parser.finish().expect("length stop keeps the text");
+        assert_eq!(text, "partial answer");
+        assert_eq!(completion.message.text(), "partial answer");
+        assert_eq!(completion.finish_reason.as_deref(), Some("length"));
+        assert!(completion.message.tool_calls.is_none());
     }
 
     #[tokio::test]

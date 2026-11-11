@@ -1380,11 +1380,16 @@ impl Agent {
                     return Ok(());
                 }
                 Some(Ok(completion)) => {
+                    let status = if completion.finish_reason.as_deref() == Some("length") {
+                        "length cap"
+                    } else {
+                        "complete"
+                    };
                     if !thinking_closed.get() {
-                        thinking.borrow_mut().close("complete");
+                        thinking.borrow_mut().close(status);
                         thinking_closed.set(true);
                     }
-                    bubble.borrow_mut().close("complete");
+                    bubble.borrow_mut().close(status);
                     self.markdown.borrow_mut().set_sink(None);
                     if reasoning_open_line.get() {
                         println!();
@@ -1436,10 +1441,34 @@ impl Agent {
             self.set_activity(footer, "Model generating", self.last_rate);
 
             let Some(tool_calls) = tool_calls else {
+                // A "length" stop on a text-only answer is the designed bound
+                // (OPENAI_NUM_PREDICT), not a failure: the partial text stays
+                // in the history, so a follow-up "continue" resumes from it.
+                if completion.finish_reason.as_deref() == Some("length") {
+                    let cap = if self.config.num_predict > 0 {
+                        format!("OPENAI_NUM_PREDICT={}", self.config.num_predict)
+                    } else {
+                        "the endpoint output cap".to_string()
+                    };
+                    println!(
+                        "{}",
+                        ui::muted(&format!(
+                            "· Response stopped at {cap}; the partial text is kept — say continue to keep going."
+                        ))
+                    );
+                }
                 self.ready(footer);
                 return Ok(());
             };
             if tool_calls.is_empty() {
+                if completion.finish_reason.as_deref() == Some("length") {
+                    println!(
+                        "{}",
+                        ui::muted(
+                            "· Response stopped at the output cap; the partial text is kept — say continue to keep going."
+                        )
+                    );
+                }
                 self.ready(footer);
                 return Ok(());
             }
