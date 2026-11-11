@@ -203,6 +203,15 @@ fn urlencode(model: &str) -> String {
     encoded
 }
 
+/// Model-name equality that tolerates the implicit `:latest` tag, matching
+/// how Ollama names loaded models in `/api/ps`.
+fn same_model_name(a: &str, b: &str) -> bool {
+    fn strip_latest(name: &str) -> &str {
+        name.strip_suffix(":latest").unwrap_or(name)
+    }
+    strip_latest(a) == strip_latest(b)
+}
+
 pub fn ollama_chat_url(endpoint: &str) -> Option<String> {
     let (scheme, rest) = endpoint.split_once("://")?;
     let (authority, path) = match rest.find('/') {
@@ -1012,8 +1021,20 @@ impl Client {
         }
         // On the native /api/chat path, tell Ollama the real context window so
         // long conversations are not truncated to its small default num_ctx.
+        // Ollama clears and reloads the runner whenever a request's num_ctx
+        // differs from the loaded one, so when the same model is already
+        // loaded with a window that covers the request, borrow its window
+        // instead of paying the reload on every chat start.
         if native_target.is_some() {
-            body["options"] = json!({ "num_ctx": self.context_window });
+            let base = ollama_base_url(&self.endpoint);
+            let num_ctx = if base.is_empty() {
+                self.context_window
+            } else {
+                self.loaded_context_window(&base)
+                    .await
+                    .unwrap_or(self.context_window)
+            };
+            body["options"] = json!({ "num_ctx": num_ctx });
         }
 
         let target = native_target
@@ -1409,6 +1430,33 @@ impl Client {
             return None;
         }
         response.json::<Value>().await.ok()
+    }
+
+    /// Window of the runner this model is already loaded with (Ollama's
+    /// `/api/ps` returns `context_length` per loaded model), when that window
+    /// covers the configured one. `None` means the model is not loaded, is a
+    /// different one, or its window is too small: the caller then sends the
+    /// configured `num_ctx` (a different-model swap or a genuinely needed
+    /// reload).
+    async fn loaded_context_window(&self, base: &str) -> Option<u64> {
+        let mut request = self
+            .http
+            .get(format!("{base}/api/ps"))
+            .timeout(Duration::from_secs(3));
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let payload = request.send().await.ok()?.json::<Value>().await.ok()?;
+        let models = payload.get("models")?.as_array()?;
+        let entry = models.iter().find(|entry| {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("model").and_then(Value::as_str));
+            name.is_some_and(|name| same_model_name(name, &self.model))
+        })?;
+        let length = entry.get("context_length").and_then(Value::as_u64)?;
+        (length >= self.context_window).then_some(length)
     }
 
     /// Whether the model provably cannot think (`thinking` absent from its
@@ -1929,6 +1977,220 @@ mod tests {
         assert!(error.to_string().contains("ENDPOINT_SHAPE"));
     }
 
+    #[tokio::test]
+    async fn native_chat_reuses_the_loaded_context_window() {
+        use crate::config::PermissionMode;
+        use std::path::PathBuf;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let server_bodies = std::sync::Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            const PS: &str = "{\"models\":[{\"name\":\"test-model\",\"context_length\":65536}]}";
+            const BODY: &str =
+                "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":1,\"prompt_eval_count\":1}\n";
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let server_bodies = std::sync::Arc::clone(&server_bodies);
+                // One task per connection: a lingering half-open connection
+                // must never block the next request in reqwest's pool.
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 16 * 1024];
+                    let count = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                    let reply: String = if request.lines().next().unwrap_or("").contains("/api/ps")
+                    {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            PS.len(),
+                            PS
+                        )
+                    } else if request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .contains("/api/show")
+                    {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                            .to_string()
+                    } else {
+                        server_bodies.lock().await.push(
+                            request
+                                .split("\r\n\r\n")
+                                .nth(1)
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            BODY.len(),
+                            BODY
+                        )
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "test-model".to_string(),
+            context_window: 32768,
+            timeout_ms: 5_000,
+            max_rounds: 32,
+            recovery_seconds: 240,
+            config_files: String::new(),
+            ollama_think: Some("true".to_string()),
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        let mut text = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_name: &str| {};
+        client
+            .complete(
+                &[Message::user("hi")],
+                None,
+                &mut on_text,
+                &mut on_reasoning,
+                &mut on_tool_call,
+            )
+            .await
+            .expect("completion");
+        let _ = server.abort();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let body = bodies.lock().await.join("\n");
+        assert!(
+            body.contains("\"num_ctx\":65536"),
+            "expected the loaded runner's window, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn smaller_loaded_context_keeps_the_configured_window() {
+        use crate::config::PermissionMode;
+        use std::path::PathBuf;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let server_bodies = std::sync::Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            const PS: &str = "{\"models\":[{\"name\":\"test-model\",\"context_length\":20480}]}";
+            const BODY: &str =
+                "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":1,\"prompt_eval_count\":1}\n";
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let server_bodies = std::sync::Arc::clone(&server_bodies);
+                // One task per connection: a lingering half-open connection
+                // must never block the next request in reqwest's pool.
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 16 * 1024];
+                    let count = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                    let reply: String = if request.lines().next().unwrap_or("").contains("/api/ps")
+                    {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            PS.len(),
+                            PS
+                        )
+                    } else if request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .contains("/api/show")
+                    {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                            .to_string()
+                    } else {
+                        server_bodies.lock().await.push(
+                            request
+                                .split("\r\n\r\n")
+                                .nth(1)
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            BODY.len(),
+                            BODY
+                        )
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "test-model".to_string(),
+            context_window: 32768,
+            timeout_ms: 5_000,
+            max_rounds: 32,
+            recovery_seconds: 240,
+            config_files: String::new(),
+            ollama_think: Some("true".to_string()),
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        let mut text = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_name: &str| {};
+        client
+            .complete(
+                &[Message::user("hi")],
+                None,
+                &mut on_text,
+                &mut on_reasoning,
+                &mut on_tool_call,
+            )
+            .await
+            .expect("completion");
+        let _ = server.abort();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let body = bodies.lock().await.join("\n");
+        // The loaded 20480 window is too small for the request: the configured
+        // window goes out and Ollama reloads once, as it must.
+        assert!(
+            body.contains("\"num_ctx\":32768"),
+            "expected the configured window, got: {body}"
+        );
+    }
+
+    #[test]
+    fn same_model_name_tolerates_the_default_tag() {
+        assert!(same_model_name("test-model", "test-model"));
+        assert!(same_model_name("test-model", "test-model:latest"));
+        assert!(same_model_name("test-model:latest", "test-model"));
+        assert!(!same_model_name("test-model", "other-model"));
+    }
+
     #[test]
     fn incomplete_stream_is_rejected() {
         let mut on_text = |_chunk: &str| {};
@@ -2045,6 +2307,15 @@ mod tests {
                 let count = socket.read(&mut buffer).await.expect("read");
                 let request = String::from_utf8_lossy(&buffer[..count]).to_string();
                 if request.lines().next().unwrap_or("").contains("/api/show") {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .expect("write probe reply");
+                    continue;
+                }
+                if request.lines().next().unwrap_or("").contains("/api/ps") {
                     socket
                         .write_all(
                             b"HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
@@ -2274,6 +2545,10 @@ mod tests {
                         SHOW.len(),
                         SHOW
                     )
+                } else if request.lines().next().unwrap_or("").contains("/api/ps") {
+                    // Unknown load state: keep the configured window.
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                        .to_string()
                 } else {
                     server_bodies.lock().await.push(
                         request
