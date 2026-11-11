@@ -340,6 +340,26 @@ budget/cut point, SSE/NDJSON parsing, gpt-oss action-tag parsing, unique tool-ca
 ids, tool validation, workspace operations, search, terminal execution, and a full
 streaming round trip against a mock HTTP server (no model required).
 
+## Troubleshooting
+
+- **AMD GPUs under Vulkan, Linux kernel 7.x: the model runner dies mid-prefill with
+  `vk::Queue::submit: ErrorDeviceLost` on long prompts** (see llama.cpp #25664).
+  The kernel 7.x default `amdgpu.lockup_timeout` is 2 s, and a single large Vulkan
+  submit from the fused DeepSeek/MLA prefill path (MoE models such as
+  glm-4.7-flash) exceeds it once the prompt passes ~10k tokens; the driver resets
+  the device (`The CS has been cancelled because the context is lost. This context
+  is innocent.`) and the runner aborts. Repeated requests then fail deterministically.
+  Fix: restore the pre-7.x timeouts via the kernel command line — append
+  `amdgpu.lockup_timeout=10000,60000,10000,10000` to `GRUB_CMDLINE_LINUX_DEFAULT`,
+  run `update-grub` and reboot. Verified as a real fix on a Radeon Renoir iGPU
+  (Ryzen 9 5900HX, Mesa RADV 26.2.6, kernel 7.0); `qwen3.8:27b` on the same host
+  was never affected.
+- With that same hardware, Ollama's host-RAM prompt cache (llama.cpp #16391,
+  8192 MiB by default) adds further RADV slowdowns and can crash in the
+  idle-slot save path. Setting `Environment=LLAMA_ARG_CACHE_RAM=0` in the
+  `ollama` systemd unit disables it (`prompt cache is disabled` appears in the
+  server log); prefix reuse inside an active slot keeps working.
+
 ## Notes
 
 - The project is intentionally a separate crate so it can evolve without touching the
