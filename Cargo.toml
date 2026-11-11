@@ -1,6 +1,6 @@
 [package]
 name = "rustagent"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 description = "A Rust clone of MinAgent: a terminal coding agent for OpenAI-compatible and Ollama endpoints"
 
