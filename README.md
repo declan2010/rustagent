@@ -110,6 +110,7 @@ to the binary.
 | `OPENAI_TIMEOUT_MS` | `0` | Request timeout; `0` disables it |
 | `OPENAI_MAX_ROUNDS` | `32` | Tool rounds per message; when the budget is exhausted the model must wrap up in text (no tools), instead of the turn failing |
 | `OPENAI_RECOVERY_SECONDS` | `240` | Recovery window for unstable endpoints: an error that collapses the stream (a crashed Ollama runner) is retried with 5s/15s/30s waits and then 60s steps while the window lasts, instead of giving up during the model reload |
+| `OPENAI_NUM_PREDICT` | `4096` | Cap on generated tokens per response on the native Ollama path (`options.num_predict`, `0` = unbounded). Without it, a model that never stops streams forever: Ollama's context shift recycles the window and at iGPU decode speeds a runaway turn can burn hours |
 | `OPENAI_OLLAMA_THINK` | unset | Enables native `/api/chat` with a think level |
 | `OPENAI_INPUT` | `text,image` | Input modalities; local Ollama models override them with their declared capabilities (`vision` → image, `audio` → audio) |
 | `TERMINAL_MODE` | `ask` | `auto`, `ask`, or `off`; `off` hides `run_terminal` |

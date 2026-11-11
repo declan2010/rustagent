@@ -40,6 +40,9 @@ pub struct Config {
     /// How long recoverable endpoint errors keep retrying
     /// (`OPENAI_RECOVERY_SECONDS`), fed to `endpoint_recovery_delays`.
     pub recovery_seconds: u64,
+    /// Cap on generated tokens per response on the native Ollama path
+    /// (`OPENAI_NUM_PREDICT`, 0 = unbounded).
+    pub num_predict: u64,
     pub ollama_think: Option<String>,
     pub input_modalities: Vec<String>,
     pub terminal_mode: PermissionMode,
@@ -317,6 +320,11 @@ pub fn load() -> Result<Config> {
             "OPENAI_RECOVERY_SECONDS",
             crate::openai::DEFAULT_ENDPOINT_RECOVERY_SECONDS,
         )?,
+        num_predict: non_negative_integer(
+            env.get("OPENAI_NUM_PREDICT"),
+            "OPENAI_NUM_PREDICT",
+            crate::openai::DEFAULT_NUM_PREDICT,
+        )?,
         ollama_think: parse_ollama_think(env.get("OPENAI_OLLAMA_THINK"))?,
         input_modalities: parse_input_modalities(env.get("OPENAI_INPUT"))?,
         terminal_mode: PermissionMode::parse(
@@ -411,6 +419,49 @@ mod tests {
         assert_eq!(
             positive_integer(Some(&"".to_string()), "OPENAI_MAX_ROUNDS", 32).unwrap(),
             32
+        );
+    }
+
+    #[test]
+    fn num_predict_defaults_to_a_generous_cap_zero_means_unbounded() {
+        // 4096 generated tokens let a model think and write a solid answer
+        // while a runaway loop dies after minutes instead of streaming
+        // forever: Ollama's context shift would otherwise recycle the window.
+        assert_eq!(
+            non_negative_integer(
+                None,
+                "OPENAI_NUM_PREDICT",
+                crate::openai::DEFAULT_NUM_PREDICT
+            )
+            .unwrap(),
+            4096
+        );
+        assert_eq!(
+            non_negative_integer(
+                Some(&"8192".to_string()),
+                "OPENAI_NUM_PREDICT",
+                crate::openai::DEFAULT_NUM_PREDICT
+            )
+            .unwrap(),
+            8192
+        );
+        // Explicit zero restores the previous unbounded behaviour.
+        assert_eq!(
+            non_negative_integer(
+                Some(&"0".to_string()),
+                "OPENAI_NUM_PREDICT",
+                crate::openai::DEFAULT_NUM_PREDICT
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            non_negative_integer(
+                Some(&"-1".to_string()),
+                "OPENAI_NUM_PREDICT",
+                crate::openai::DEFAULT_NUM_PREDICT
+            )
+            .is_err()
         );
     }
 

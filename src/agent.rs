@@ -1747,6 +1747,7 @@ mod tests {
             timeout_ms: 0,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],

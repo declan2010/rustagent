@@ -21,6 +21,9 @@ const ENDPOINT_RECOVERY_STEP_MS: u64 = 60_000;
 /// Default duration of the endpoint-recovery window pushed through
 /// `OPENAI_RECOVERY_SECONDS`.
 pub const DEFAULT_ENDPOINT_RECOVERY_SECONDS: u64 = 240;
+/// Cap on generated tokens per native response (`OPENAI_NUM_PREDICT`,
+/// 0 = unbounded, matching the previous behaviour).
+pub const DEFAULT_NUM_PREDICT: u64 = 4096;
 
 /// Complete retry schedule for a recovery window: MinAgent's 5s/15s/30s
 /// openings followed by 60s steps while they still fit inside the window.
@@ -916,6 +919,11 @@ pub struct Client {
     /// How long recoverable endpoint failures keep retrying before the error
     /// is surfaced, from `OPENAI_RECOVERY_SECONDS`.
     pub recovery_seconds: u64,
+    /// Cap on generated tokens per response on the native Ollama path
+    /// (`OPENAI_NUM_PREDICT`, 0 = unbounded). Bounds runaway generations:
+    /// Ollama's context shift otherwise recycles the window and a model
+    /// that never stops streams until the user interrupts.
+    pub num_predict: u64,
     /// Models that rejected the `think` option with HTTP 400 ("does not
     /// support thinking"): subsequent requests for them omit `think`.
     thinking_disabled: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -945,6 +953,7 @@ impl Client {
             ollama_think: config.ollama_think.clone(),
             context_window: config.context_window,
             recovery_seconds: config.recovery_seconds,
+            num_predict: config.num_predict,
             thinking_disabled: std::sync::Mutex::new(std::collections::HashSet::new()),
             think_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             show_failed: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1034,7 +1043,14 @@ impl Client {
                     .await
                     .unwrap_or(self.context_window)
             };
-            body["options"] = json!({ "num_ctx": num_ctx });
+            let mut options = json!({ "num_ctx": num_ctx });
+            // Bound runaway generations: Ollama's context shift recycles the
+            // window and a model that never stops would otherwise stream at
+            // decode speed until the user interrupts. Zero = no bound.
+            if self.num_predict > 0 {
+                options["num_predict"] = json!(self.num_predict);
+            }
+            body["options"] = options;
         }
 
         let target = native_target
@@ -2045,6 +2061,7 @@ mod tests {
             timeout_ms: 5_000,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: Some("true".to_string()),
             input_modalities: vec!["text".to_string()],
@@ -2147,6 +2164,7 @@ mod tests {
             timeout_ms: 5_000,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: Some("true".to_string()),
             input_modalities: vec!["text".to_string()],
@@ -2189,6 +2207,108 @@ mod tests {
         assert!(same_model_name("test-model", "test-model:latest"));
         assert!(same_model_name("test-model:latest", "test-model"));
         assert!(!same_model_name("test-model", "other-model"));
+    }
+
+    #[tokio::test]
+    async fn native_chat_sends_the_num_predict_cap_when_configured() {
+        use crate::config::PermissionMode;
+        use std::path::PathBuf;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let server_bodies = std::sync::Arc::clone(&bodies);
+        let server = tokio::spawn(async move {
+            const BODY: &str =
+                "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"eval_count\":1,\"prompt_eval_count\":1}\n";
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let server_bodies = std::sync::Arc::clone(&server_bodies);
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 16 * 1024];
+                    let count = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                    let reply: String = if request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .contains("/api/show")
+                    {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                            .to_string()
+                    } else if request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .contains("/api/ps")
+                    {
+                        // Unknown load state: the configured window goes out.
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                            .to_string()
+                    } else {
+                        server_bodies.lock().await.push(
+                            request
+                                .split("\r\n\r\n")
+                                .nth(1)
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            BODY.len(),
+                            BODY
+                        )
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+
+        let config = Config {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: None,
+            model: "test-model".to_string(),
+            context_window: 8192,
+            timeout_ms: 5_000,
+            max_rounds: 32,
+            recovery_seconds: 240,
+            num_predict: 1234,
+            config_files: String::new(),
+            ollama_think: Some("true".to_string()),
+            input_modalities: vec!["text".to_string()],
+            terminal_mode: PermissionMode::Off,
+            skills_mode: PermissionMode::Off,
+            mcp_mode: PermissionMode::Off,
+            root: PathBuf::from("."),
+            workspace_name: "test".to_string(),
+        };
+        let client = Client::new(&config).expect("client");
+        let mut text = String::new();
+        let mut on_text = |chunk: &str| text.push_str(chunk);
+        let mut on_reasoning = |_chunk: &str| {};
+        let mut on_tool_call = |_name: &str| {};
+        client
+            .complete(
+                &[Message::user("hi")],
+                None,
+                &mut on_text,
+                &mut on_reasoning,
+                &mut on_tool_call,
+            )
+            .await
+            .expect("completion");
+        let _ = server.abort();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let body = bodies.lock().await.join("\n");
+        assert!(
+            body.contains("\"num_predict\":1234"),
+            "expected the num_predict cap in options, got: {body}"
+        );
     }
 
     #[test]
@@ -2245,6 +2365,7 @@ mod tests {
             timeout_ms: 5_000,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
@@ -2362,6 +2483,7 @@ mod tests {
             timeout_ms: 5_000,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: Some("true".to_string()),
             input_modalities: vec!["text".to_string()],
@@ -2579,6 +2701,7 @@ mod tests {
             timeout_ms: 5_000,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: Some("low".to_string()),
             input_modalities: vec!["text".to_string()],
@@ -2752,6 +2875,7 @@ mod tests {
             timeout_ms: 5_000,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
@@ -2826,6 +2950,7 @@ mod tests {
             timeout_ms: 5_000,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
@@ -2895,6 +3020,7 @@ mod context_show_tests {
             timeout_ms: 5_000,
             max_rounds: 32,
             recovery_seconds: 240,
+            num_predict: 0,
             config_files: String::new(),
             ollama_think: None,
             input_modalities: vec!["text".to_string()],
