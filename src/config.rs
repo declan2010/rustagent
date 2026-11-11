@@ -121,6 +121,17 @@ fn positive_integer(value: Option<&String>, name: &str, fallback: u64) -> Result
     }
 }
 
+/// Picks the context window for the resolved endpoint: a cloud endpoint may
+/// carry a bigger window (`OPENAI_CONTEXT_WINDOW_CLOUD`; 0 keeps the same
+/// window everywhere), while local endpoints always use the base budget.
+fn resolve_window_for_endpoint(endpoint: &str, base: u64, cloud: u64) -> u64 {
+    if !crate::agent::is_local_endpoint(endpoint) && cloud > 0 {
+        cloud
+    } else {
+        base
+    }
+}
+
 fn non_negative_integer(value: Option<&String>, name: &str, fallback: u64) -> Result<u64> {
     match value.map(|value| value.trim()) {
         None | Some("") => Ok(fallback),
@@ -300,6 +311,21 @@ pub fn load() -> Result<Config> {
             .unwrap_or("https://api.openai.com/v1"),
     )?;
 
+    let base_window = positive_integer(
+        env.get("OPENAI_CONTEXT_WINDOW"),
+        "OPENAI_CONTEXT_WINDOW",
+        262_144,
+    )?;
+    // A cloud endpoint can carry a much bigger window: prefill runs on the
+    // server there, so the local hardware budget does not apply
+    // (`OPENAI_CONTEXT_WINDOW_CLOUD`; 0 keeps the same window everywhere).
+    let cloud_window = non_negative_integer(
+        env.get("OPENAI_CONTEXT_WINDOW_CLOUD"),
+        "OPENAI_CONTEXT_WINDOW_CLOUD",
+        0,
+    )?;
+    let context_window = resolve_window_for_endpoint(&endpoint, base_window, cloud_window);
+
     Ok(Config {
         endpoint,
         api_key: env
@@ -307,11 +333,7 @@ pub fn load() -> Result<Config> {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
         model,
-        context_window: positive_integer(
-            env.get("OPENAI_CONTEXT_WINDOW"),
-            "OPENAI_CONTEXT_WINDOW",
-            262_144,
-        )?,
+        context_window,
         timeout_ms: non_negative_integer(env.get("OPENAI_TIMEOUT_MS"), "OPENAI_TIMEOUT_MS", 0)?,
         max_rounds: positive_integer(env.get("OPENAI_MAX_ROUNDS"), "OPENAI_MAX_ROUNDS", 32)?
             as usize,
@@ -419,6 +441,30 @@ mod tests {
         assert_eq!(
             positive_integer(Some(&"".to_string()), "OPENAI_MAX_ROUNDS", 32).unwrap(),
             32
+        );
+    }
+
+    #[test]
+    fn context_window_switches_to_the_cloud_budget_on_cloud_endpoints() {
+        // Local endpoints always run on the base budget, whatever the cloud
+        // override says: prefill speed is the local constraint.
+        assert_eq!(
+            resolve_window_for_endpoint("http://127.0.0.1:11434/v1/chat/completions", 32_768, 131_072),
+            32_768
+        );
+        assert_eq!(
+            resolve_window_for_endpoint("http://localhost:11434/v1/chat/completions", 32_768, 131_072),
+            32_768
+        );
+        // Cloud endpoints take the override when one is set...
+        assert_eq!(
+            resolve_window_for_endpoint("https://api.openai.com/v1/chat/completions", 32_768, 131_072),
+            131_072
+        );
+        // ...and keep the base budget when the override is zero (unset).
+        assert_eq!(
+            resolve_window_for_endpoint("https://api.openai.com/v1/chat/completions", 32_768, 0),
+            32_768
         );
     }
 

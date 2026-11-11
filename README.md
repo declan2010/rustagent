@@ -107,6 +107,7 @@ to the binary.
 | `OPENAI_API_KEY` | unset | Bearer token |
 | `OPENAI_MODEL` | required | Model identifier |
 | `OPENAI_CONTEXT_WINDOW` | `262144` | Context window cap; local Ollama models also clamp to their declared maximum |
+| `OPENAI_CONTEXT_WINDOW_CLOUD` | `0` | Context window used on cloud endpoints instead of the base one (`0` = same window everywhere). Cloud prefill runs server-side, so a bigger budget costs no local time |
 | `OPENAI_TIMEOUT_MS` | `0` | Request timeout; `0` disables it |
 | `OPENAI_MAX_ROUNDS` | `32` | Tool rounds per message; when the budget is exhausted the model must wrap up in text (no tools), instead of the turn failing |
 | `OPENAI_RECOVERY_SECONDS` | `240` | Recovery window for unstable endpoints: an error that collapses the stream (a crashed Ollama runner) is retried with 5s/15s/30s waits and then 60s steps while the window lasts, instead of giving up during the model reload |

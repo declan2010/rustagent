@@ -333,6 +333,9 @@ fn dynamic_suffix(proc_time: Duration, rate: Option<f64>) -> String {
     if let Some(rate) = format_tokens_per_second(rate) {
         parts.push(ui::muted(&rate));
     }
+    // Always report the running build at the tail of the status row, so the
+    // version stays visible even when the session header has scrolled away.
+    parts.push(ui::muted(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     if parts.is_empty() {
         String::new()
     } else {
@@ -443,7 +446,7 @@ fn build_transcript(messages: &[Message]) -> String {
     transcript
 }
 
-fn is_local_endpoint(endpoint: &str) -> bool {
+pub(crate) fn is_local_endpoint(endpoint: &str) -> bool {
     endpoint.starts_with("http://127.0.0.1")
         || endpoint.starts_with("http://localhost")
         || endpoint.starts_with("http://[::1]")
@@ -1669,6 +1672,30 @@ mod tests {
         assert_eq!(compaction_budget(65536), (16384, 16384));
         assert_eq!(compaction_budget(262144), (16384, 20000));
         assert_eq!(compaction_budget(4096), (1024, 1024));
+    }
+
+    #[test]
+    fn dynamic_suffix_always_carries_the_build_version() {
+        // The status tail must identify the running build even when proc time
+        // and the rate meter are absent (fresh prompt, nothing generated yet).
+        let tail = dynamic_suffix(Duration::ZERO, None);
+        assert!(
+            tail.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "expected the build version in the status tail, got: {tail}"
+        );
+
+        let full = dynamic_suffix(Duration::from_secs(65), Some(2.6));
+        assert!(full.contains("proc"));
+        assert!(full.contains("t/s"));
+        assert!(
+            full.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "expected the build version after proc and rate, got: {full}"
+        );
+        // Version always closes the status row, after the dynamic parts.
+        let version_position = full
+            .find(&format!("v{}", env!("CARGO_PKG_VERSION")))
+            .expect("version present");
+        assert!(full.rfind("proc").unwrap() < version_position);
     }
 
     #[test]

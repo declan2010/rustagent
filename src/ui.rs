@@ -438,7 +438,11 @@ impl AssistantBubble {
         let columns = terminal_columns();
         Self {
             label,
-            content_width: 8.max(96.min(columns.saturating_sub(4))),
+            // The frame row is content_width + 4 cells wide; keeping it short
+            // of the terminal's last column avoids the wrap-pending state on
+            // every row (see `user_bubble_geometry` for why that desyncs the
+            // transcript at the scroll-region bottom on some terminals).
+            content_width: 8.max(96.min(columns.saturating_sub(5))),
             style,
             opened: false,
             line_width: 0,
@@ -483,7 +487,7 @@ impl AssistantBubble {
     fn live_content_width(&self) -> usize {
         match terminal_size() {
             Some((Width(width), _)) => {
-                8.max(self.content_width.min(width.saturating_sub(4) as usize))
+                8.max(self.content_width.min(width.saturating_sub(5) as usize))
             }
             None => self.content_width,
         }
@@ -741,7 +745,12 @@ fn user_bubble_geometry(text: &str, columns: usize) -> (String, usize, Vec<Strin
         .unwrap_or(4)
         .max(4);
     let outer_width = content_width + 4;
-    let indent = " ".repeat(columns.saturating_sub(outer_width));
+    // One spare column keeps every echo row short of the terminal's last
+    // column: a row that lands exactly on the right edge leaves the terminal
+    // in the wrap-pending state, and the newline that follows then behaves
+    // differently across terminals (Konsole vs xterm) right where the row
+    // crosses the scroll-region bottom — which desyncs the transcript.
+    let indent = " ".repeat(columns.saturating_sub(outer_width + 1));
     (indent, content_width, lines)
 }
 
@@ -1004,8 +1013,10 @@ mod ui_bubble_tests {
     #[test]
     fn bubble_geometry_pushes_right_and_keeps_the_frame_closed() {
         let (indent, content_width, lines) = user_bubble_geometry("hi there", 80);
-        // The frame is outer = content + 4 wide, so the indent is columns - outer.
-        assert_eq!(indent.len(), 80 - (content_width + 4));
+        // The frame is outer = content + 4 wide, and the indent keeps one
+        // spare column so no echo row ends on the terminal's last column
+        // (wrap-pending at the scroll-region bottom desyncs the transcript).
+        assert_eq!(indent.len(), 80 - (content_width + 4) - 1);
         assert_eq!(lines, vec!["hi there".to_string()]);
         assert_eq!(content_width, 8);
         // A long message wraps at 66 content columns max.
@@ -1019,7 +1030,7 @@ mod ui_bubble_tests {
         assert_eq!(narrow_width, 4);
         assert_eq!(
             narrow_indent.len(),
-            20usize.saturating_sub(narrow_width + 4)
+            20usize.saturating_sub(narrow_width + 4 + 1)
         );
     }
 }
