@@ -235,25 +235,54 @@ pub fn enable_raw_mode() -> Option<()> {
 
 #[cfg(unix)]
 fn async_fd_stdin() -> Option<tokio::io::unix::AsyncFd<std::fs::File>> {
+    use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
-    // SAFETY: `dup` produces a new fd referring to the same open file description.
-    // Setting O_NONBLOCK affects that shared description, which is fine because
-    // this reader is the only consumer of stdin.
+    // On an interactive terminal fds 0/1/2 share one open file description,
+    // so setting O_NONBLOCK on a dup of stdin leaks it to stdout and stderr
+    // too. With stdout nonblocking, a backed-up terminal (a long paste keeps
+    // the UI redrawing faster than the terminal drains) makes every println!
+    // fail with EAGAIN, and the std print macros panic on that error: the
+    // session dies mid-paste with no visible message, because the panic text
+    // itself goes to the same blocked stderr. Reopening the controlling
+    // terminal instead yields a fresh description whose O_NONBLOCK stays
+    // private to this reader, leaving stdout blocking. Piped input keeps the
+    // dup: there stdin and stdout are separate pipes, so the flag cannot
+    // leak, and /dev/tty would be the wrong source anyway.
+    let file = if std::io::stdin().is_terminal() {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/tty")
+            .ok()
+    } else {
+        None
+    };
+    let file = match file {
+        Some(file) => file,
+        None => {
+            // SAFETY: `dup` produces a new fd referring to the same open file
+            // description; the O_NONBLOCK below then applies to it. When
+            // stdin is not a terminal that description is a pipe, which
+            // cannot leak to stdout, and this reader is its only consumer.
+            unsafe {
+                let fd = libc::dup(libc::STDIN_FILENO);
+                if fd < 0 {
+                    return None;
+                }
+                std::fs::File::from_raw_fd(fd)
+            }
+        }
+    };
+    // SAFETY: `fcntl` on a valid descriptor and `AsyncFd::register` with the
+    // required O_NONBLOCK already set; both calls only touch `file`.
     unsafe {
-        let fd = libc::dup(libc::STDIN_FILENO);
-        if fd < 0 {
-            return None;
-        }
-        let flags = libc::fcntl(fd, libc::F_GETFL);
+        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
         if flags < 0 {
-            libc::close(fd);
+            // Dropping `file` closes the descriptor on all return paths below.
             return None;
         }
-        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            libc::close(fd);
+        if libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
             return None;
         }
-        let file = std::fs::File::from_raw_fd(fd);
         match tokio::io::unix::AsyncFd::register(file) {
             Ok(async_fd) => Some(async_fd),
             Err(_) => None,
